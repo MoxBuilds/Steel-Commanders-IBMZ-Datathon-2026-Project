@@ -1,0 +1,1429 @@
+#!/usr/bin/env python3
+#Student Planner
+#===============
+#A tkinter student planner that can pull your class timetable from a university
+#timetable service over a URL.
+
+#Most universities (and Moodle, Canvas, Blackboard, Syllabus+, Scientia,
+#MyTimetable, Outlook/Google calendar exports, etc.) publish a personal
+#calendar subscription link in the standard iCalendar (.ics) format. Paste that
+#link (https:// or webcal://) into the "Timetable Sources" tab and the app
+#will download and parse it in the background.
+
+#Features
+#--------
+#* Weekly timetable view built from one or more timetable URLs
+#* Recurring classes (RRULE: DAILY / WEEKLY / MONTHLY / YEARLY, BYDAY, COUNT, UNTIL, EXDATE)
+#* Task / assignment tracker with due dates, courses, priority, done flag
+#* "Next up" banner, overdue highlighting
+#* Offline cache: the last downloaded timetable is stored locally
+#* Optional auto-sync on startup, optional request headers (e.g. a token)
+#* Unlimited calendar URLs: yours plus classmates' shared calendars, each with an
+#  owner (Me / Classmate), a colour, and a show/hide switch
+#* Study Group Planner: pick several calendars and find the times when everyone is free
+
+#Only the Python standard library is used. Python 3.9+ recommended.
+#Data is stored in  ~/.student_planner.json
+
+
+import json
+import re
+import threading
+import queue
+import uuid
+import urllib.request
+import urllib.error
+from datetime import datetime, date, time, timedelta
+from pathlib import Path
+ 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9
+    ZoneInfo = None
+ 
+import tkinter as tk
+from tkinter import ttk, messagebox
+from tkinter import font as tkfont
+ 
+DATA_FILE = Path.home() / ".student_planner.json"
+ISO = "%Y-%m-%dT%H:%M:%S"
+DUE_FMT = "%Y-%m-%d %H:%M"
+WEEKDAYS = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
+COLORS = {  # calendar colour name -> row background
+    "Blue": "#dbeafe", "Green": "#dcfce7", "Orange": "#ffedd5", "Pink": "#fce7f3",
+    "Purple": "#ede9fe", "Teal": "#ccfbf1", "Yellow": "#fef9c3", "Grey": "#e5e7eb",
+}
+OWNERS = ["Me", "Classmate"]
+ 
+ 
+# ----------------------------------------------------------------------------
+# iCalendar parsing
+# ----------------------------------------------------------------------------
+def normalise_url(url: str) -> str:
+    """webcal:// and webcals:// are just https:// in disguise."""
+    url = url.strip()
+    low = url.lower()
+    if low.startswith("webcal://") or low.startswith("webcals://"):
+        url = "https://" + url.split("://", 1)[1]
+    return url
+ 
+ 
+def _unescape(text: str) -> str:
+    return (text.replace("\\n", "\n").replace("\\N", "\n")
+                .replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\"))
+ 
+ 
+def _parse_dt(value: str, params: dict):
+    """Return (naive local datetime, all_day)."""
+    value = value.strip()
+    if params.get("VALUE") == "DATE" or (len(value) == 8 and "T" not in value):
+        d = datetime.strptime(value[:8], "%Y%m%d")
+        return d, True
+    if value.endswith("Z"):
+        dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ")
+        from datetime import timezone
+        dt = dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+        return dt, False
+    dt = datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
+    tzid = params.get("TZID")
+    if tzid and ZoneInfo:
+        try:
+            dt = dt.replace(tzinfo=ZoneInfo(tzid)).astimezone().replace(tzinfo=None)
+        except Exception:
+            pass  # unknown zone: treat as local time
+    return dt, False
+ 
+ 
+def _unfold(text: str):
+    return re.sub(r"\r?\n[ \t]", "", text).splitlines()
+ 
+ 
+def _split_prop(line: str):
+    head, _, value = line.partition(":")
+    parts = head.split(";")
+    name = parts[0].upper()
+    params = {}
+    for p in parts[1:]:
+        k, _, v = p.partition("=")
+        params[k.upper()] = v.strip('"')
+    return name, params, value
+ 
+ 
+def _parse_rrule(value: str) -> dict:
+    rule = {}
+    for part in value.split(";"):
+        k, _, v = part.partition("=")
+        rule[k.upper()] = v
+    return rule
+ 
+ 
+def _add_months(d: datetime, n: int):
+    m = d.month - 1 + n
+    y, m = d.year + m // 12, m % 12 + 1
+    try:
+        return d.replace(year=y, month=m)
+    except ValueError:
+        return None
+ 
+ 
+def _expand(start, rule, win_start, win_end, until_params):
+    """Yield occurrence start datetimes of a recurring event within the window."""
+    freq = rule.get("FREQ", "")
+    interval = int(rule.get("INTERVAL", 1) or 1)
+    count = int(rule["COUNT"]) if "COUNT" in rule else None
+    until = None
+    if "UNTIL" in rule:
+        try:
+            until, is_date = _parse_dt(rule["UNTIL"], until_params)
+            if is_date:
+                until += timedelta(days=1) - timedelta(seconds=1)
+        except Exception:
+            until = None
+    byday = [d[-2:] for d in rule.get("BYDAY", "").split(",") if d]
+    produced = 0
+    limit = min(win_end, until) if until else win_end
+
+    if freq == "WEEKLY":
+        week0 = start - timedelta(days=start.weekday())
+        days = sorted(WEEKDAYS.index(d) for d in byday) if byday else [start.weekday()]
+        k = 0
+        while k < 3000:
+            base = week0 + timedelta(weeks=k * interval)
+            if base > limit:
+                return
+            for wd in days:
+                dt = base + timedelta(days=wd)
+                if dt > limit:
+                    return
+                if dt < start:
+                    continue
+                produced += 1
+                if count is not None and produced > count:
+                    return
+                if dt >= win_start:
+                    yield dt
+            k += 1
+    elif freq in ("DAILY", "MONTHLY", "YEARLY"):
+        k = 0
+        while k < 5000:
+            if freq == "DAILY":
+                dt = start + timedelta(days=k * interval)
+            elif freq == "MONTHLY":
+                dt = _add_months(start, k * interval)
+            else:
+                dt = _add_months(start, k * interval * 12)
+            k += 1
+            if dt is None:
+                continue
+            if dt > limit:
+                return
+            produced += 1
+            if count is not None and produced > count:
+                return
+            if dt >= win_start:
+                yield dt
+    else:
+        if win_start <= start <= win_end:
+            yield start
+ 
+ 
+def parse_ics(text: str, back_days=60, forward_days=400):
+    """Parse an .ics feed into a list of event dicts (recurrences expanded)."""
+    now = datetime.now()
+    win_start = now - timedelta(days=back_days)
+    win_end = now + timedelta(days=forward_days)
+    events, cur = [], None
+    for line in _unfold(text):
+        if line == "BEGIN:VEVENT":
+            cur = {"props": {}, "exdates": []}
+            continue
+        if line == "END:VEVENT" and cur is not None:
+            events.extend(_finish_event(cur, win_start, win_end))
+            cur = None
+            continue
+        if cur is None or ":" not in line:
+            continue
+        name, params, value = _split_prop(line)
+        if name == "EXDATE":
+            for v in value.split(","):
+                try:
+                    cur["exdates"].append(_parse_dt(v, params)[0])
+                except Exception:
+                    pass
+        else:
+            cur["props"][name] = (params, value)
+    events.sort(key=lambda e: e["start"])
+    return events
+ 
+ 
+def _finish_event(raw, win_start, win_end):
+    p = raw["props"]
+    if "DTSTART" not in p:
+        return []
+    try:
+        start, all_day = _parse_dt(p["DTSTART"][1], p["DTSTART"][0])
+        if "DTEND" in p:
+            end, _ = _parse_dt(p["DTEND"][1], p["DTEND"][0])
+        else:
+            end = start + (timedelta(days=1) if all_day else timedelta(hours=1))
+    except Exception:
+        return []
+    dur = end - start
+ 
+    def text(key):
+        return _unescape(p[key][1]).strip() if key in p else ""
+ 
+    base = {
+        "uid": text("UID"),
+        "title": text("SUMMARY") or "(untitled)",
+        "location": text("LOCATION"),
+        "description": text("DESCRIPTION"),
+        "all_day": all_day,
+    }
+    if "RRULE" in p:
+        starts = _expand(start, _parse_rrule(p["RRULE"][1]), win_start, win_end,
+                         p["DTSTART"][0])
+    else:
+        starts = [start] if win_start - dur <= start <= win_end else []
+    out = []
+    ex = set(raw["exdates"])
+    for s in starts:
+        if s in ex:
+            continue
+        out.append({**base, "start": s.strftime(ISO), "end": (s + dur).strftime(ISO)})
+    return out
+ 
+ 
+# ----------------------------------------------------------------------------
+# Storage
+# ----------------------------------------------------------------------------
+class Store:
+    def __init__(self, path=DATA_FILE):
+        self.path = Path(path)
+        self.data = {"sources": [], "tasks": [], "events": {}, "last_sync": {},
+                     "settings": {"auto_sync": True}}
+        self.load()
+ 
+    def load(self):
+        try:
+            raw = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        try:
+            loaded = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(loaded, dict):
+            return
+        settings = loaded.get("settings")
+        self.data["sources"] = loaded.get("sources", []) if isinstance(loaded.get("sources"), list) else []
+        self.data["tasks"] = loaded.get("tasks", []) if isinstance(loaded.get("tasks"), list) else []
+        self.data["events"] = loaded.get("events", {}) if isinstance(loaded.get("events"), dict) else {}
+        self.data["last_sync"] = loaded.get("last_sync", {}) if isinstance(loaded.get("last_sync"), dict) else {}
+        self.data["settings"] = {"auto_sync": True}
+        if isinstance(settings, dict):
+            self.data["settings"].update(settings)
+        self.data["settings"].setdefault("auto_sync", True)
+ 
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        except OSError as e:
+            messagebox.showerror("Save failed", str(e))
+ 
+    # convenience
+    @property
+    def sources(self):
+        return self.data["sources"]
+ 
+    @property
+    def tasks(self):
+        return self.data["tasks"]
+ 
+    def all_events(self, only_visible=True):
+        meta = {s["name"]: s for s in self.sources}
+        evs = []
+        for src, lst in self.data["events"].items():
+            s = meta.get(src)
+            if s is None or (only_visible and not s.get("visible", True)):
+                continue
+            for e in lst:
+                evs.append({**e, "source": src, "owner": s.get("owner", "Me")})
+        evs.sort(key=lambda e: e["start"])
+        return evs
+ 
+ 
+# ----------------------------------------------------------------------------
+# Network
+# ----------------------------------------------------------------------------
+def fetch_timetable(url: str, headers=None, timeout=20):
+    if headers is None:
+        headers = {}
+    elif not isinstance(headers, dict):
+        headers = dict(headers)
+    req = urllib.request.Request(normalise_url(url), headers={
+        "User-Agent": "StudentPlanner/1.0 (+tkinter)",
+        "Accept": "text/calendar, text/plain, */*",
+        **headers,
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        charset = resp.headers.get_content_charset() or "utf-8"
+    text = raw.decode(charset, errors="replace")
+    if "BEGIN:VCALENDAR" not in text:
+        raise ValueError("The URL did not return an iCalendar (.ics) feed. "
+                         "You may need to log in or use the 'subscribe/export' link.")
+    return parse_ics(text)
+ 
+ 
+# ----------------------------------------------------------------------------
+# Free-time finder
+# ----------------------------------------------------------------------------
+def free_slots(events, day, start_t, end_t, min_minutes):
+    """Return [(start, end)] gaps on `day` (within start_t..end_t) when none of
+    `events` is happening and the gap is at least `min_minutes` long."""
+    ws, we = datetime.combine(day, start_t), datetime.combine(day, end_t)
+    need = timedelta(minutes=min_minutes)
+    busy = []
+    for e in events:
+        if e.get("all_day"):
+            continue
+        s, en = datetime.strptime(e["start"], ISO), datetime.strptime(e["end"], ISO)
+        if en <= ws or s >= we:
+            continue
+        busy.append((max(s, ws), min(en, we)))
+    busy.sort()
+    out, cursor = [], ws
+    for s, en in busy:
+        if s - cursor >= need:
+            out.append((cursor, s))
+        cursor = max(cursor, en)
+    if we - cursor >= need:
+        out.append((cursor, we))
+    return out
+ 
+ 
+# ----------------------------------------------------------------------------
+# View helpers (Week / Day grids and the availability heatmap)
+# ----------------------------------------------------------------------------
+def layout_overlaps(items):
+    """Place overlapping events side by side.
+ 
+    items: iterable of (start, end, payload).
+    Returns a list of (payload, lane, lane_count, start, end): `lane` is the
+    column the event sits in and `lane_count` how many columns its cluster of
+    overlapping events needs, so width = column_width / lane_count.
+    """
+    result, cluster, lane_ends, cluster_end = [], [], [], None
+ 
+    def flush():
+        n = len(lane_ends)
+        for payload, lane, s, e in cluster:
+            result.append((payload, lane, n, s, e))
+ 
+    for s, e, payload in sorted(items, key=lambda x: (x[0], x[1])):
+        if cluster and s >= cluster_end:
+            flush()
+            cluster, lane_ends, cluster_end = [], [], None
+        lane = next((i for i, le in enumerate(lane_ends) if le <= s), None)
+        if lane is None:
+            lane_ends.append(e)
+            lane = len(lane_ends) - 1
+        else:
+            lane_ends[lane] = e
+        cluster.append((payload, lane, s, e))
+        cluster_end = e if cluster_end is None else max(cluster_end, e)
+    flush()
+    return result
+ 
+ 
+def heat_color(fraction):
+    """Blend red (nobody free, 0.0) to green (everyone free, 1.0)."""
+    lo, hi = (254, 202, 202), (74, 222, 128)
+    f = max(0.0, min(1.0, fraction))
+    return "#%02x%02x%02x" % tuple(round(a + (b - a) * f) for a, b in zip(lo, hi))
+ 
+ 
+# ----------------------------------------------------------------------------
+# GUI
+# ----------------------------------------------------------------------------
+class FormDialog(tk.Toplevel):
+    """Tiny generic form: fields = [(key, label, default, kind)], kind in entry/combo."""
+ 
+    def __init__(self, parent, title, fields, on_ok):
+        super().__init__(parent)
+        self.title(title)
+        self.transient(parent)
+        self.resizable(False, False)
+        self.vars, self.on_ok = {}, on_ok
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+        first = None
+        for i, (key, label, default, kind, *opts) in enumerate(fields):
+            ttk.Label(frm, text=label).grid(row=i, column=0, sticky="w", pady=3, padx=(0, 8))
+            var = tk.StringVar(value=default)
+            self.vars[key] = var
+            if kind == "combo":
+                w = ttk.Combobox(frm, textvariable=var, values=opts[0], state="readonly", width=38)
+            else:
+                w = ttk.Entry(frm, textvariable=var, width=40)
+            w.grid(row=i, column=1, pady=3)
+            first = first or w
+        btns = ttk.Frame(frm)
+        btns.grid(row=len(fields), column=0, columnspan=2, pady=(10, 0), sticky="e")
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=4)
+        ttk.Button(btns, text="Save", command=self._ok).pack(side="right")
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        assert first is not None
+        first.focus_set()
+        self.grab_set()
+ 
+    def _ok(self):
+        values = {k: v.get().strip() for k, v in self.vars.items()}
+        if self.on_ok(values) is not False:
+            self.destroy()
+ 
+ 
+class PlannerApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Student Planner")
+        self.geometry("980x640")
+        self.minsize(820, 520)
+        self.store = Store()
+        self.cursor = date.today()      # the date the Timetable views are centred on
+        self._tt_events = {}
+        self._redraw_job = None
+        self._last_canvas_w = 0
+        self._grid_widths = {}
+        self._column_drag = None
+        self._heat_meta = None
+        self.q = queue.Queue()
+        self.syncing = 0
+ 
+        ttk.Style(self).theme_use("clam" if "clam" in ttk.Style(self).theme_names() else "default")
+        self._build()
+        self.refresh_all()
+        self.after(150, self._poll_queue)
+        self.after(60_000, self._tick)
+        self.protocol("WM_DELETE_WINDOW", self._quit)
+        if self.store.data["settings"].get("auto_sync") and self.store.sources:
+            self.after(500, self.sync_all)
+ 
+    # ---------------- layout ----------------
+    def _build(self):
+        top = ttk.Frame(self, padding=(10, 8))
+        top.pack(fill="x")
+        self.next_var = tk.StringVar()
+        ttk.Label(top, textvariable=self.next_var, font=("TkDefaultFont", 11, "bold")).pack(side="left")
+        self.sync_btn = ttk.Button(top, text="⟳ Sync timetables", command=self.sync_all)
+        self.sync_btn.pack(side="right")
+ 
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        self._build_timetable_tab()
+        self._build_tasks_tab()
+        self._build_sources_tab()
+        self._build_free_tab()
+ 
+        self.status = tk.StringVar(value="Ready")
+        ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w",
+                  padding=(8, 2)).pack(fill="x", side="bottom")
+ 
+    # ----- timetable tab (List / Week / Day / Month views)
+    VIEWS = ("List", "Week", "Day", "Month")
+    GRID_GUTTER = 52   # width of the hour labels on the left of Week / Day views
+    GRID_HEADER = 30   # height of the column header row
+    HOUR_H = 48        # pixels per hour in Week / Day views
+ 
+    def _build_timetable_tab(self):
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="Timetable")
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="◀", width=3, command=lambda: self._shift(-1)).pack(side="left")
+        ttk.Button(bar, text="Today", command=lambda: self._shift(0, reset=True)).pack(side="left", padx=4)
+        ttk.Button(bar, text="▶", width=3, command=lambda: self._shift(1)).pack(side="left")
+        self.week_label = ttk.Label(bar, font=("TkDefaultFont", 11, "bold"))
+        self.week_label.pack(side="left", padx=12)
+ 
+        # view switcher (List / Week / Day / Month)
+        self.view_var = tk.StringVar(value="Week")
+        switch = ttk.Frame(bar)
+        switch.pack(side="right")
+        for v in self.VIEWS:
+            ttk.Radiobutton(switch, text=v, value=v, variable=self.view_var, style="Toolbutton",
+                            command=self.refresh_timetable).pack(side="left", padx=1)
+ 
+        # tasks due in the period being shown
+        self.due_var = tk.StringVar()
+        ttk.Label(tab, textvariable=self.due_var, foreground="#b00020", wraplength=880,
+                  justify="left").pack(fill="x", pady=(0, 4))
+ 
+        self.tt_body = ttk.Frame(tab)
+        self.tt_body.pack(fill="both", expand=True)
+ 
+        # --- List view: a Treeview grouped by day
+        self.list_frame = ttk.Frame(self.tt_body)
+        cols = ("time", "title", "location", "source")
+        self.tt = ttk.Treeview(self.list_frame, columns=cols, show="tree headings", selectmode="browse")
+        self.tt.heading("#0", text="Day")
+        self.tt.column("#0", width=150, stretch=False)
+        for c, t, w in (("time", "Time", 110), ("title", "Class / Event", 340),
+                        ("location", "Location", 220), ("source", "Source", 120)):
+            self.tt.heading(c, text=t)
+            self.tt.column(c, width=w)
+        self.tt.tag_configure("day", background="#e6edf5", font=("TkDefaultFont", 10, "bold"))
+        self.tt.tag_configure("today", background="#fff3c4", font=("TkDefaultFont", 10, "bold"))
+        sb = ttk.Scrollbar(self.list_frame, orient="vertical", command=self.tt.yview)
+        self.tt.configure(yscrollcommand=sb.set)
+        self.tt.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tt.bind("<Double-1>", self._list_detail)
+ 
+        # --- Week / Day / Month views: drawn on a Canvas
+        self.grid_frame = ttk.Frame(self.tt_body)
+        self.cv = tk.Canvas(self.grid_frame, background="white", highlightthickness=0)
+        cv_sb = ttk.Scrollbar(self.grid_frame, orient="vertical", command=self.cv.yview)
+        self.cv.configure(yscrollcommand=cv_sb.set)
+        self.cv.pack(side="left", fill="both", expand=True)
+        cv_sb.pack(side="right", fill="y")
+        self.cv.bind("<Configure>", self._on_canvas_resize)
+        self.cv.bind("<B1-Motion>", self._resize_grid_column)
+        self.cv.bind("<ButtonRelease-1>", self._end_grid_column_resize)
+        self.cv.bind("<MouseWheel>", lambda e: self.cv.yview_scroll(-2 if e.delta > 0 else 2, "units"))
+        self.cv.bind("<Button-4>", lambda e: self.cv.yview_scroll(-2, "units"))   # Linux wheel up
+        self.cv.bind("<Button-5>", lambda e: self.cv.yview_scroll(2, "units"))    # Linux wheel down
+ 
+    def source_color(self, index):
+        """Background colour of the source at `index` (falls back to the palette order)."""
+        palette = list(COLORS.values())
+        s = self.store.sources[index]
+        return COLORS.get(s.get("color"), palette[index % len(palette)])
+ 
+    def _color_of(self, name):
+        for i, s in enumerate(self.store.sources):
+            if s["name"] == name:
+                return self.source_color(i)
+        return "#e5e7eb"
+ 
+    @staticmethod
+    def _dt(text):
+        return datetime.strptime(text, ISO)
+ 
+    def _sunday(self):
+        return self.cursor - timedelta(days=(self.cursor.weekday() + 1) % 7)
+ 
+    def _events_on(self, events, day):
+        return [e for e in events if self._dt(e["start"]).date() == day]
+ 
+    def _tasks_due(self, d0, d1):
+        """Unfinished tasks due between dates d0 and d1 (inclusive), soonest first."""
+        out = []
+        for t in self.store.tasks:
+            if t["done"] or not t["due"]:
+                continue
+            try:
+                due = datetime.strptime(t["due"], DUE_FMT)
+            except ValueError:
+                continue
+            if d0 <= due.date() <= d1:
+                out.append((due, t))
+        return sorted(out, key=lambda x: x[0])
+ 
+    def _shift(self, delta, reset=False):
+        """◀ / Today / ▶ — steps by a day, week or month depending on the view."""
+        if reset:
+            self.cursor = date.today()
+        else:
+            view = self.view_var.get()
+            if view == "Day":
+                self.cursor += timedelta(days=delta)
+            elif view == "Month":
+                m = self.cursor.month - 1 + delta
+                self.cursor = date(self.cursor.year + m // 12, m % 12 + 1, 1)
+            else:
+                self.cursor += timedelta(weeks=delta)
+        self.refresh_timetable()
+ 
+    def _on_canvas_resize(self, event):
+        if abs(event.width - self._last_canvas_w) < 3:
+            return
+        self._last_canvas_w = event.width
+        if self._redraw_job:
+            self.after_cancel(self._redraw_job)
+        self._redraw_job = self.after(80, self.refresh_timetable)
+ 
+    def _goto_day(self, day):
+        self.cursor = day
+        self.view_var.set("Day")
+        self.refresh_timetable()
+ 
+    def refresh_timetable(self):
+        self._redraw_job = None
+        view = self.view_var.get()
+        today = date.today()
+        events = self.store.all_events()
+        self._tt_events = {}
+        if view == "Day":
+            d0 = d1 = self.cursor
+            label = f"{self.cursor:%A %d %B %Y}"
+        elif view == "Month":
+            d0 = self.cursor.replace(day=1)
+            d1 = (d0 + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+            label = f"{d0:%B %Y}"
+        else:  # List and Week both show Sunday–Saturday
+            d0 = self._sunday()
+            d1 = d0 + timedelta(days=6)
+            label = f"{d0:%d %b} – {d1:%d %b %Y}"
+        self.week_label.config(text=label)
+ 
+        due = self._tasks_due(d0, d1) if view != "Month" else []
+        self.due_var.set("Due: " + "; ".join(f"{t['title']} ({d:%a %H:%M})" for d, t in due) if due else "")
+ 
+        if view == "List":
+            self.grid_frame.pack_forget()
+            self.list_frame.pack(fill="both", expand=True)
+            self._draw_list(d0, today, events)
+            return
+        self.list_frame.pack_forget()
+        self.grid_frame.pack(fill="both", expand=True)
+        scroll = self.cv.yview()[0]
+        self.cv.delete("all")
+        if view == "Week":
+            self._draw_week(d0, events, today)
+        elif view == "Day":
+            self._draw_day(events)
+        else:
+            self._draw_month(d0, events, today)
+        self.cv.yview_moveto(scroll)
+ 
+    # ---- List view
+    def _draw_list(self, monday, today, events):
+        self.tt.delete(*self.tt.get_children())
+        for i, s in enumerate(self.store.sources):
+            self.tt.tag_configure(f"src{i}", background=self.source_color(i)) # type: ignore
+        tag_of = {s["name"]: f"src{i}" for i, s in enumerate(self.store.sources)}
+        for i in range(7):
+            day = monday + timedelta(days=i)
+            day_events = self._events_on(events, day)
+            tag = "today" if day == today else "day"
+            parent = self.tt.insert("", "end", text=f"{day:%A %d %b}", open=True, tags=(tag,))
+            if not day_events:
+                self.tt.insert(parent, "end", values=("", "—", "", ""))
+            for e in day_events:
+                s, en = self._dt(e["start"]), self._dt(e["end"])
+                when = "All day" if e["all_day"] else f"{s:%H:%M} – {en:%H:%M}"
+                who = e["source"] if e["owner"] == "Me" else f"{e['source']} (classmate)"
+                iid = self.tt.insert(parent, "end", tags=(tag_of.get(e["source"], ""),),
+                                     values=(when, e["title"], e["location"], who))
+                self._tt_events[iid] = e
+ 
+    def _list_detail(self, _event):
+        sel = self.tt.selection()
+        e = self._tt_events.get(sel[0]) if sel else None
+        if e:
+            self._show_event(e)
+ 
+    def _show_event(self, e):
+        s, en = self._dt(e["start"]), self._dt(e["end"])
+        when = "All day" if e["all_day"] else f"{s:%H:%M} – {en:%H:%M}"
+        body = (f"{e['title']}\n\n{s:%A %d %B %Y}, {when}\n"
+                f"Location: {e['location'] or '—'}\nSource: {e['source']} ({e['owner']})\n\n"
+                f"{e['description'] or ''}")
+        messagebox.showinfo("Event details", body)
+ 
+    # ---- Week and Day views (shared time grid)
+    def _hour_range(self, events, days):
+        """First and last hour to show: at least 08:00–18:00, widened to fit the events."""
+        lo, hi = 8, 18
+        for e in events:
+            if e["all_day"]:
+                continue
+            s, en = self._dt(e["start"]), self._dt(e["end"])
+            if s.date() not in days:
+                continue
+            lo = min(lo, s.hour)
+            if en.date() > s.date():
+                hi = 24
+            else:
+                hi = max(hi, en.hour + (1 if en.minute or en.second else 0))
+        return max(0, lo), min(24, max(hi, lo + 1))
+ 
+    def _draw_week(self, monday, events, today):
+        days = [monday + timedelta(days=i) for i in range(7)]
+        columns = [{"title": f"{d:%a %d}", "date": d, "highlight": d == today,
+                    "events": self._events_on(events, d)} for d in days]
+        lo, hi = self._hour_range(events, set(days))
+        self._draw_time_grid(columns, lo, hi)
+ 
+    def _draw_day(self, events):
+        """One column per visible calendar, so you can compare classmates side by side."""
+        day = self.cursor
+        todays = self._events_on(events, day)
+        names = [s["name"] for s in self.store.sources if s.get("visible", True)]
+        if not names:
+            self.cv.create_text(20, 20, anchor="nw", text="Add a timetable source to see it here.")
+            return
+        columns = [{"title": n, "date": day, "fill": self._color_of(n),
+                    "events": [e for e in todays if e["source"] == n]} for n in names]
+        lo, hi = self._hour_range(events, {day})
+        self._draw_time_grid(columns, lo, hi)
+ 
+    def _draw_time_grid(self, columns, lo, hi):
+        cv = self.cv
+        width = max(cv.winfo_width(), 700 if cv.winfo_width() < 100 else 0)
+        gut, head, hh = self.GRID_GUTTER, self.GRID_HEADER, self.HOUR_H
+        available_width = width - gut - 4
+        same_day = len({col.get("date") for col in columns}) == 1
+        width_key = ("Day", tuple(col["title"] for col in columns)) if same_day else ("Week",)
+        weights = self._grid_widths.setdefault(width_key, [1.0] * len(columns))
+        if len(weights) != len(columns):
+            weights = [1.0] * len(columns)
+            self._grid_widths[width_key] = weights
+        total_weight = sum(weights)
+        column_widths = [available_width * weight / total_weight for weight in weights]
+        column_xs = [gut]
+        for col_width in column_widths:
+            column_xs.append(column_xs[-1] + col_width) # pyright: ignore[reportArgumentType]
+        event_font = tkfont.Font(font=("TkDefaultFont", 8))
+
+        def fit_text(text, max_width):
+            if event_font.measure(text) <= max_width:
+                return text
+            ellipsis = "…"
+            if event_font.measure(ellipsis) > max_width:
+                return ""
+            while text and event_font.measure(text + ellipsis) > max_width:
+                text = text[:-1]
+            return text.rstrip() + ellipsis
+
+        all_day = any(e["all_day"] for c in columns for e in c["events"])
+        top = head + (18 if all_day else 0)
+        bottom = top + (hi - lo) * hh
+ 
+        for c, col in enumerate(columns):
+            x0, colw = column_xs[c], column_widths[c]
+            if col.get("highlight"):
+                cv.create_rectangle(x0, top, x0 + colw, bottom, fill="#fffbe6", outline="")
+            cv.create_rectangle(x0, 0, x0 + colw, head, fill=col.get("fill", "#e6edf5"), outline="#c9d3df")
+            cv.create_text(x0 + colw / 2, head / 2, text=col["title"], font=("TkDefaultFont", 10, "bold"))
+        for h in range(lo, hi + 1):
+            y = top + (h - lo) * hh
+            cv.create_line(gut, y, width - 4, y, fill="#e5e7eb")
+            cv.create_text(gut - 6, y, text=f"{h:02d}:00", anchor="e", fill="#6b7280", font=("TkDefaultFont", 8))
+        for x in column_xs:
+            cv.create_line(x, head, x, bottom, fill="#e5e7eb")
+
+        n = 0
+        for c, col in enumerate(columns):
+            x0, colw = column_xs[c], column_widths[c]
+            # all-day strip
+            ad = [e for e in col["events"] if e["all_day"]]
+            if ad:
+                tag = f"ev{n}"
+                n += 1
+                sources = {e.get("source") for e in ad if e.get("source")}
+                fill = self._color_of(next(iter(sources))) if len(sources) == 1 else "#dfe7f2"
+                cv.create_rectangle(x0 + 1, head, x0 + colw - 1, top, fill=fill, # type: ignore
+                                    outline="#9ca3af", tags=(tag,))
+                text = fit_text(" · ".join(e["title"] for e in ad), colw - 8)
+                cv.create_text(x0 + 4, head + 2, anchor="nw", font=event_font, tags=(tag,), text=text)
+                cv.tag_bind(tag, "<Button-1>", lambda _ev, e=ad[0]: self._show_event(e))
+            # timed events, overlapping ones split into lanes
+            timed = [(self._dt(e["start"]), self._dt(e["end"]), e) for e in col["events"] if not e["all_day"]]
+            for e, lane, lanes, s, en in layout_overlaps(timed):
+                start_h = s.hour + s.minute / 60
+                end_h = hi if en.date() > s.date() else en.hour + en.minute / 60
+                y0 = top + (max(start_h, lo) - lo) * hh
+                y1 = max(top + (min(end_h, hi) - lo) * hh, y0 + 16)
+                lane_w = (colw - 4) / lanes
+                x = x0 + 2 + lane * lane_w
+                tag = f"ev{n}"
+                n += 1
+                cv.create_rectangle(x, y0, x + lane_w - 2, y1, fill=self._color_of(e["source"]), # type: ignore
+                                    outline="#9ca3af", tags=(tag,))
+                text = fit_text(f"{s:%H:%M} {e['title']}", lane_w - 10)
+                lines = [text] if text else []
+                if e["location"] and y1 - y0 >= event_font.metrics("linespace") * 2 + 6:
+                    location = fit_text(e["location"], lane_w - 10)
+                    if location:
+                        lines.append(location)
+                cv.create_text(x + 4, y0 + 3, text="\n".join(lines), anchor="nw",
+                               font=event_font, tags=(tag,))
+                cv.tag_bind(tag, "<Button-1>", lambda _ev, e=e: self._show_event(e))
+            # "now" line
+            if col.get("date") == date.today():
+                now = datetime.now()
+                hnow = now.hour + now.minute / 60
+                if lo <= hnow <= hi:
+                    y = top + (hnow - lo) * hh
+                    cv.create_line(x0, y, x0 + colw, y, fill="#dc2626", width=2)
+        for boundary in range(1, len(columns)):
+            x = column_xs[boundary]
+            tag = f"resize{boundary}"
+            cv.create_line(x, 0, x, bottom, fill="#94a3b8", width=5, tags=(tag,))
+            cv.tag_bind(tag, "<Enter>", lambda _e: cv.configure(cursor="sb_h_double_arrow"))
+            cv.tag_bind(tag, "<Leave>", lambda _e: cv.configure(cursor=""))
+            cv.tag_bind(tag, "<Button-1>",
+                        lambda event, i=boundary, k=width_key, w=column_widths:
+                        self._start_grid_column_resize(event, k, i, w))
+        cv.configure(scrollregion=(0, 0, width, bottom + 4))
+
+    def _start_grid_column_resize(self, event, width_key, boundary, widths):
+        self._column_drag = (width_key, boundary, self.cv.canvasx(event.x), list(widths))
+
+    def _end_grid_column_resize(self, _event):
+        self._column_drag = None
+
+    def _resize_grid_column(self, event):
+        if self._column_drag is None:
+            return
+        width_key, boundary, start_x, initial_widths = self._column_drag
+        delta = self.cv.canvasx(event.x) - start_x
+        min_width = min(48, initial_widths[boundary - 1], initial_widths[boundary])
+        delta = min(max(delta, min_width - initial_widths[boundary - 1]),
+                    initial_widths[boundary] - min_width)
+        resized = list(initial_widths)
+        resized[boundary - 1] += delta
+        resized[boundary] -= delta
+        self._grid_widths[width_key] = resized
+        self.refresh_timetable()
+ 
+    # ---- Month view
+    def _draw_month(self, first, events, today):
+        cv = self.cv
+        width = cv.winfo_width() if cv.winfo_width() >= 100 else 900
+        height = cv.winfo_height() if cv.winfo_height() >= 100 else 420
+        head = self.GRID_HEADER
+        start = first - timedelta(days=(first.weekday() + 1) % 7)
+        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        weeks = (last - start).days // 7 + 1
+        cw, ch = (width - 4) / 7, max(84, (height - head - 4) / weeks)
+ 
+        for c, name in enumerate(("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")):
+            cv.create_rectangle(2 + c * cw, 0, 2 + (c + 1) * cw, head, fill="#e6edf5", outline="#c9d3df")
+            cv.create_text(2 + c * cw + cw / 2, head / 2, text=name, font=("TkDefaultFont", 10, "bold"))
+ 
+        by_day = {}
+        for e in events:
+            by_day.setdefault(self._dt(e["start"]).date(), []).append(e)
+        due_by_day = {}
+        for due, t in self._tasks_due(start, start + timedelta(days=weeks * 7 - 1)):
+            due_by_day.setdefault(due.date(), []).append(t)
+ 
+        chars = max(6, int((cw - 12) / 5.5))
+        for w in range(weeks):
+            for c in range(7):
+                d = start + timedelta(days=w * 7 + c)
+                x0, y0 = 2 + c * cw, head + w * ch
+                in_month = d.month == first.month
+                tag = f"day{w}_{c}"
+                fill = "#fffbe6" if d == today else ("white" if in_month else "#f3f4f6")
+                cv.create_rectangle(x0, y0, x0 + cw, y0 + ch, fill=fill, outline="#d1d5db", tags=(tag,))
+                cv.create_text(x0 + 5, y0 + 3, text=str(d.day), anchor="nw", tags=(tag,),
+                               font=("TkDefaultFont", 9, "bold" if d == today else "normal"),
+                               fill="#111827" if in_month else "#9ca3af")
+                evs = sorted(by_day.get(d, []), key=lambda e: e["start"])
+                due = due_by_day.get(d, [])
+                room = max(1, int((ch - 22) // 14) - (1 if due else 0))
+                shown = evs if len(evs) <= room else evs[:room - 1]
+                y = y0 + 20
+                for e in shown:
+                    label = e["title"] if e["all_day"] else f"{self._dt(e['start']):%H:%M} {e['title']}"
+                    if len(label) > chars:
+                        label = label[:chars - 1] + "…"
+                    cv.create_rectangle(x0 + 3, y, x0 + cw - 3, y + 13, fill=self._color_of(e["source"]), # type: ignore
+                                        outline="", tags=(tag,))
+                    cv.create_text(x0 + 5, y + 1, text=label, anchor="nw", font=("TkDefaultFont", 8), tags=(tag,))
+                    y += 14
+                if len(evs) > len(shown):
+                    cv.create_text(x0 + 5, y + 1, text=f"+{len(evs) - len(shown)} more", anchor="nw",
+                                   fill="#6b7280", font=("TkDefaultFont", 8), tags=(tag,))
+                if due:
+                    cv.create_text(x0 + 5, y0 + ch - 4, text=f"● {len(due)} due", anchor="sw", fill="#b00020",
+                                   font=("TkDefaultFont", 8, "bold"), tags=(tag,))
+                cv.tag_bind(tag, "<Button-1>", lambda _ev, d=d: self._goto_day(d))
+        cv.configure(scrollregion=(0, 0, width, head + weeks * ch + 4))
+ 
+    # ----- tasks tab
+    def _build_tasks_tab(self):
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="Tasks & Assignments")
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="Add", command=self.add_task).pack(side="left")
+        ttk.Button(bar, text="Edit", command=self.edit_task).pack(side="left", padx=4)
+        ttk.Button(bar, text="Toggle done", command=self.toggle_task).pack(side="left")
+        ttk.Button(bar, text="Delete", command=self.delete_task).pack(side="left", padx=4)
+        self.show_done = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Show completed", variable=self.show_done,
+                        command=self.refresh_tasks).pack(side="right")
+ 
+        cols = ("done", "title", "course", "due", "priority")
+        self.tv = ttk.Treeview(tab, columns=cols, show="headings", selectmode="browse")
+        for c, t, w in (("done", "✓", 40), ("title", "Task", 330), ("course", "Course", 130),
+                        ("due", "Due", 140), ("priority", "Priority", 80)):
+            self.tv.heading(c, text=t)
+            self.tv.column(c, width=w, anchor="center" if c in ("done", "priority") else "w")
+        self.tv.tag_configure("overdue", foreground="#b00020")
+        self.tv.tag_configure("soon", foreground="#b36b00")
+        self.tv.tag_configure("done", foreground="#888888")
+        sb = ttk.Scrollbar(tab, orient="vertical", command=self.tv.yview)
+        self.tv.configure(yscrollcommand=sb.set)
+        self.tv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tv.bind("<Double-1>", lambda e: self.edit_task())
+ 
+    def _task_fields(self, t=None):
+        t = t or {}
+        return [("title", "Task", t.get("title", ""), "entry"),
+                ("course", "Course", t.get("course", ""), "entry"),
+                ("due", "Due (YYYY-MM-DD HH:MM)", t.get("due", (date.today() + timedelta(days=7)).strftime("%Y-%m-%d 23:59")), "entry"),
+                ("priority", "Priority", t.get("priority", "Medium"), "combo", ["Low", "Medium", "High"])]
+ 
+    def _validate_task(self, v):
+        if not v["title"]:
+            messagebox.showwarning("Missing title", "Please enter a task title.")
+            return False
+        if v["due"]:
+            try:
+                datetime.strptime(v["due"], DUE_FMT)
+            except ValueError:
+                try:
+                    v["due"] = datetime.strptime(v["due"], "%Y-%m-%d").strftime("%Y-%m-%d 23:59")
+                except ValueError:
+                    messagebox.showwarning("Bad date", "Use YYYY-MM-DD HH:MM (e.g. 2026-11-02 17:00).")
+                    return False
+        return True
+ 
+    def add_task(self):
+        def ok(v):
+            if not self._validate_task(v):
+                return False
+            self.store.tasks.append({"id": uuid.uuid4().hex, "done": False, **v})
+            self.store.save()
+            self.refresh_tasks()
+        FormDialog(self, "Add task", self._task_fields(), ok)
+ 
+    def _selected_task(self):
+        sel = self.tv.selection()
+        return next((t for t in self.store.tasks if t["id"] == sel[0]), None) if sel else None
+ 
+    def edit_task(self):
+        t = self._selected_task()
+        if not t:
+            return
+        def ok(v):
+            if not self._validate_task(v):
+                return False
+            t.update(v)
+            self.store.save()
+            self.refresh_tasks()
+        FormDialog(self, "Edit task", self._task_fields(t), ok)
+ 
+    def toggle_task(self):
+        t = self._selected_task()
+        if t:
+            t["done"] = not t["done"]
+            self.store.save()
+            self.refresh_tasks()
+ 
+    def delete_task(self):
+        t = self._selected_task()
+        if t and messagebox.askyesno("Delete", f"Delete “{t['title']}”?"):
+            self.store.tasks.remove(t)
+            self.store.save()
+            self.refresh_tasks()
+ 
+    def refresh_tasks(self):
+        self.tv.delete(*self.tv.get_children())
+        now = datetime.now()
+        prio = {"High": 0, "Medium": 1, "Low": 2}
+        tasks = sorted(self.store.tasks, key=lambda t: (t["done"], t["due"] or "9999", prio.get(t["priority"], 1)))
+        for t in tasks:
+            if t["done"] and not self.show_done.get():
+                continue
+            tag = ()
+            if t["done"]:
+                tag = ("done",)
+            elif t["due"]:
+                due = datetime.strptime(t["due"], DUE_FMT)
+                tag = ("overdue",) if due < now else (("soon",) if due - now < timedelta(days=2) else ())
+            self.tv.insert("", "end", iid=t["id"], tags=tag,
+                           values=("✔" if t["done"] else "", t["title"], t["course"], t["due"], t["priority"]))
+ 
+    # ----- sources tab
+    def _build_sources_tab(self):
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="Timetable Sources")
+        info = ("Add as many calendar links as you like: your own timetable plus classmates' shared "
+                "calendars (iCal / webcal links — look for “Subscribe”, “Export”, “Publish” or "
+                "“Secret address in iCal format”).")
+        ttk.Label(tab, text=info, wraplength=880, justify="left").pack(anchor="w", pady=(0, 6))
+        bar = ttk.Frame(tab)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(bar, text="Add source", command=self.add_source).pack(side="left")
+        ttk.Button(bar, text="Edit", command=self.edit_source).pack(side="left", padx=4)
+        ttk.Button(bar, text="Remove", command=self.remove_source).pack(side="left")
+        ttk.Button(bar, text="Sync selected", command=self.sync_selected).pack(side="left", padx=4)
+        ttk.Button(bar, text="Show / hide", command=self.toggle_source).pack(side="left")
+        self.auto_var = tk.BooleanVar(value=self.store.data["settings"].get("auto_sync", True))
+        ttk.Checkbutton(bar, text="Sync on startup", variable=self.auto_var,
+                        command=self._save_settings).pack(side="right")
+ 
+        cols = ("shown", "name", "owner", "url", "synced", "count")
+        self.sv = ttk.Treeview(tab, columns=cols, show="headings", selectmode="browse")
+        for c, t, w in (("shown", "Shown", 55), ("name", "Name", 140), ("owner", "Owner", 80),
+                        ("url", "URL", 340), ("synced", "Last synced", 120), ("count", "Events", 55)):
+            self.sv.heading(c, text=t)
+            self.sv.column(c, width=w, anchor="center" if c in ("shown", "count") else "w")
+        self.sv.pack(fill="both", expand=True)
+        self.sv.bind("<Double-1>", lambda e: self.edit_source())
+ 
+        hint = ("Tips: ask classmates to send you their calendar's iCal link (Google Calendar: Settings → "
+                "“Secret address in iCal format”; Outlook: Publish calendar). Treat those links like "
+                "passwords — they are stored as plain text in ~/.student_planner.json. If a service needs a "
+                "token header, add it under “Edit” as  Header-Name: value.")
+        ttk.Label(tab, text=hint, wraplength=880, foreground="#555").pack(anchor="w", pady=(6, 0))
+ 
+    def _save_settings(self):
+        self.store.data["settings"]["auto_sync"] = self.auto_var.get()
+        self.store.save()
+ 
+    def _source_fields(self, s=None):
+        s = s or {}
+        used = {x.get("color") for x in self.store.sources}
+        default_color = next((c for c in COLORS if c not in used), "Blue")
+        return [("name", "Name", s.get("name", "My Timetable"), "entry"),
+                ("url", "URL (https:// or webcal://)", s.get("url", ""), "entry"),
+                ("owner", "Whose calendar", s.get("owner", "Me" if not self.store.sources else "Classmate"),
+                 "combo", OWNERS),
+                ("color", "Colour", s.get("color", default_color), "combo", list(COLORS)),
+                ("headers", "Extra header (Name: value)", s.get("headers", ""), "entry")]
+ 
+    def add_source(self):
+        def ok(v):
+            if not v["url"] or not v["name"]:
+                messagebox.showwarning("Missing info", "Name and URL are required.")
+                return False
+            if any(s["name"] == v["name"] for s in self.store.sources):
+                messagebox.showwarning("Duplicate", "A source with that name already exists.")
+                return False
+            v["visible"] = True
+            self.store.sources.append(v)
+            self.store.save()
+            self.refresh_all()
+            self.sync_sources([v])
+        FormDialog(self, "Add timetable source", self._source_fields(), ok)
+ 
+    def _selected_source(self):
+        sel = self.sv.selection()
+        return next((s for s in self.store.sources if s["name"] == sel[0]), None) if sel else None
+ 
+    def edit_source(self):
+        s = self._selected_source()
+        if not s:
+            return
+        old = s["name"]
+        def ok(v):
+            if not v["url"] or not v["name"]:
+                messagebox.showwarning("Missing info", "Name and URL are required.")
+                return False
+            if v["name"] != old:
+                for d in (self.store.data["events"], self.store.data["last_sync"]):
+                    if old in d:
+                        d[v["name"]] = d.pop(old)
+            s.update(v)
+            self.store.save()
+            self.refresh_all()
+        FormDialog(self, "Edit source", self._source_fields(s), ok)
+ 
+    def remove_source(self):
+        s = self._selected_source()
+        if s and messagebox.askyesno("Remove", f"Remove “{s['name']}” and its cached events?"):
+            self.store.sources.remove(s)
+            self.store.data["events"].pop(s["name"], None)
+            self.store.data["last_sync"].pop(s["name"], None)
+            self.store.save()
+            self.refresh_all()
+ 
+    def toggle_source(self):
+        s = self._selected_source()
+        if s:
+            s["visible"] = not s.get("visible", True)
+            self.store.save()
+            self.refresh_all()
+            self.sv.selection_set(s["name"])
+ 
+    def refresh_sources(self):
+        self.sv.delete(*self.sv.get_children())
+        for i, s in enumerate(self.store.sources):
+            n = len(self.store.data["events"].get(s["name"], []))
+            self.sv.tag_configure(f"src{i}", background=self.source_color(i)) # type: ignore
+            self.sv.insert("", "end", iid=s["name"], tags=(f"src{i}",),
+                           values=("✔" if s.get("visible", True) else "", s["name"], s.get("owner", "Me"),
+                                   s["url"], self.store.data["last_sync"].get(s["name"], "never"), n))
+        self.refresh_free_list()
+ 
+    # ----- study group planner tab
+    def _build_free_tab(self):
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="Study Group Planner")
+        ttk.Label(tab, wraplength=880, justify="left",
+                  text="Select two or more calendars (Ctrl/Shift-click) and find the times when everyone "
+                       "is free. Sync first so every calendar is up to date.").pack(anchor="w", pady=(0, 6))
+        body = ttk.Frame(tab)
+        body.pack(fill="both", expand=True)
+ 
+        left = ttk.LabelFrame(body, text="Compare calendars", padding=6)
+        left.pack(side="left", fill="y")
+        self.fl = tk.Listbox(left, selectmode="extended", exportselection=False, width=26, height=12)
+        self.fl.pack(fill="y", expand=True)
+ 
+        mid = ttk.LabelFrame(body, text="Options", padding=6)
+        mid.pack(side="left", fill="y", padx=8)
+        self.f_start = tk.StringVar(value=date.today().strftime("%Y-%m-%d"))
+        self.f_days = tk.StringVar(value="7")
+        self.f_from = tk.StringVar(value="09:00")
+        self.f_to = tk.StringVar(value="18:00")
+        self.f_len = tk.StringVar(value="60")
+        self.f_weekends = tk.BooleanVar(value=False)
+        for r, (label, var) in enumerate((("Start date", self.f_start), ("Number of days", self.f_days),
+                                          ("Day starts (HH:MM)", self.f_from), ("Day ends (HH:MM)", self.f_to),
+                                          ("Min length (minutes)", self.f_len))):
+            ttk.Label(mid, text=label).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(mid, textvariable=var, width=12).grid(row=r, column=1, padx=(8, 0), pady=2)
+        ttk.Checkbutton(mid, text="Include weekends", variable=self.f_weekends).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Button(mid, text="Find common free time", command=self.find_free).grid(
+            row=6, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+ 
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True)
+        self.fnb = ttk.Notebook(right)
+        self.fnb.pack(fill="both", expand=True)
+        slots_tab = ttk.Frame(self.fnb, padding=4)
+        heat_tab = ttk.Frame(self.fnb, padding=4)
+        self.fnb.add(slots_tab, text="Free slots")
+        self.fnb.add(heat_tab, text="Heatmap")
+ 
+        # --- Free slots list
+        cols = ("day", "from", "to", "length")
+        self.fv = ttk.Treeview(slots_tab, columns=cols, show="headings", selectmode="extended")
+        for c, t, w in (("day", "Day", 160), ("from", "From", 70), ("to", "To", 70), ("length", "Length", 90)):
+            self.fv.heading(c, text=t)
+            self.fv.column(c, width=w)
+        self.fv.pack(fill="both", expand=True)
+        btns = ttk.Frame(slots_tab)
+        btns.pack(fill="x", pady=(6, 0))
+        ttk.Button(btns, text="Copy selected to clipboard", command=self.copy_slots).pack(side="left")
+        ttk.Button(btns, text="Add selected as study task", command=self.slot_to_task).pack(side="left", padx=6)
+        self._slots = {}
+ 
+        # --- Availability heatmap (30-minute cells, shaded by how many people are free)
+        ttk.Label(heat_tab, foreground="#555",
+                  text="Green = all free, red = none free. Click a cell for details."
+                  ).pack(anchor="w", pady=(0, 4))
+        wrap = ttk.Frame(heat_tab)
+        wrap.pack(fill="both", expand=True)
+        self.hv = tk.Canvas(wrap, background="white", highlightthickness=0)
+        hy = ttk.Scrollbar(wrap, orient="vertical", command=self.hv.yview)
+        hx = ttk.Scrollbar(heat_tab, orient="horizontal", command=self.hv.xview)
+        self.hv.configure(yscrollcommand=hy.set, xscrollcommand=hx.set)
+        hy.pack(side="right", fill="y")
+        self.hv.pack(side="left", fill="both", expand=True)
+        hx.pack(fill="x")
+        self.hv.bind("<Button-1>", self._heat_click)
+ 
+    def refresh_free_list(self):
+        chosen = {self.fl.get(i) for i in self.fl.curselection()}
+        self.fl.delete(0, "end")
+        for i, s in enumerate(self.store.sources):
+            self.fl.insert("end", s["name"])
+            self.fl.itemconfig(i, background=self.source_color(i))
+            if s["name"] in chosen:
+                self.fl.selection_set(i)
+ 
+    def find_free(self):
+        names = [self.fl.get(i) for i in self.fl.curselection()]
+        if not names:
+            messagebox.showinfo("Pick calendars", "Select at least one calendar to check.")
+            return
+        try:
+            start = datetime.strptime(self.f_start.get().strip(), "%Y-%m-%d").date()
+            days = max(1, min(60, int(self.f_days.get())))
+            t_from = datetime.strptime(self.f_from.get().strip(), "%H:%M").time()
+            t_to = datetime.strptime(self.f_to.get().strip(), "%H:%M").time()
+            min_len = max(5, int(self.f_len.get()))
+            if t_to <= t_from:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Check options", "Use YYYY-MM-DD for the date, HH:MM for times "
+                                   "(end after start), and whole numbers for days and minutes.")
+            return
+        unsynced = [n for n in names if n not in self.store.data["events"]]
+        if unsynced:
+            messagebox.showwarning("Not synced yet", "These calendars have no events yet, so they'd look "
+                                   "completely free:\n\n" + "\n".join(unsynced) + "\n\nSync them first.")
+            return
+        events = [e for e in self.store.all_events(only_visible=False)
+                  if e["source"] in names and not e["all_day"]]
+        self.fv.delete(*self.fv.get_children())
+        self._slots = {}
+        for i in range(days):
+            day = start + timedelta(days=i)
+            if day.weekday() >= 5 and not self.f_weekends.get():
+                continue
+            for s, e in free_slots(events, day, t_from, t_to, min_len):
+                mins = int((e - s).total_seconds() // 60)
+                length = f"{mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"{mins} min"
+                iid = self.fv.insert("", "end", values=(f"{day:%a %d %b}", f"{s:%H:%M}", f"{e:%H:%M}", length))
+                self._slots[iid] = (s, e)
+        n = len(self._slots)
+        self.status.set(f"{n} common free slot(s) across {len(names)} calendar(s)" if n
+                        else "No common free time found — try a longer range or shorter minimum length.")
+        self._draw_heatmap(names, events, start, days, t_from, t_to)
+ 
+    def _draw_heatmap(self, names, events, start, days, t_from, t_to, step=30):
+        """Grid of days × 30-minute slots, shaded by the share of people who are free."""
+        cv = self.hv
+        cv.delete("all")
+        busy_by_person = {n: [(self._dt(e["start"]), self._dt(e["end"])) for e in events if e["source"] == n]
+                          for n in names}
+        dates = [start + timedelta(days=i) for i in range(days)
+                 if self.f_weekends.get() or (start + timedelta(days=i)).weekday() < 5]
+        t0, t1 = t_from.hour * 60 + t_from.minute, t_to.hour * 60 + t_to.minute
+        rows = list(range(t0, t1, step))
+        gut, head, cw, ch = 52, 34, 66, 22
+        cells = {}
+        for c, d in enumerate(dates):
+            cv.create_rectangle(gut + c * cw, 0, gut + (c + 1) * cw, head, fill="#e6edf5", outline="#c9d3df")
+            cv.create_text(gut + c * cw + cw / 2, head / 2, text=f"{d:%a}\n{d:%d %b}",
+                           font=("TkDefaultFont", 8, "bold"), justify="center")
+        for r, minute in enumerate(rows):
+            y = head + r * ch
+            if minute % 60 == 0:
+                cv.create_text(gut - 6, y, text=f"{minute // 60:02d}:00", anchor="e", fill="#6b7280",
+                               font=("TkDefaultFont", 8))
+            for c, d in enumerate(dates):
+                s = datetime.combine(d, time()) + timedelta(minutes=minute)
+                e = min(s + timedelta(minutes=step), datetime.combine(d, t_to))
+                free = [n for n in names if not any(bs < e and be > s for bs, be in busy_by_person[n])]
+                busy = [n for n in names if n not in free]
+                x0 = gut + c * cw
+                cv.create_rectangle(x0, y, x0 + cw, y + ch, fill=heat_color(len(free) / len(names)), outline="white")
+                if len(names) > 1:
+                    cv.create_text(x0 + cw / 2, y + ch / 2, text=f"{len(free)}/{len(names)}",
+                                   font=("TkDefaultFont", 8), fill="#374151")
+                cells[(r, c)] = (s, e, free, busy)
+        self._heat_meta = {"gut": gut, "head": head, "cw": cw, "ch": ch, "cells": cells}
+        cv.configure(scrollregion=(0, 0, gut + len(dates) * cw + 4, head + len(rows) * ch + 4))
+        cv.xview_moveto(0)
+        cv.yview_moveto(0)
+ 
+    def _heat_click(self, event):
+        m = self._heat_meta
+        if not m:
+            return
+        x, y = self.hv.canvasx(event.x), self.hv.canvasy(event.y)
+        cell = m["cells"].get((int((y - m["head"]) // m["ch"]), int((x - m["gut"]) // m["cw"])))
+        if not cell:
+            return
+        s, e, free, busy = cell
+        text = f"{s:%A %d %b}, {s:%H:%M}–{e:%H:%M}\n\nFree: {', '.join(free) or '—'}\nBusy: {', '.join(busy) or '—'}"
+        if not busy:
+            if messagebox.askyesno("Everyone is free", text + "\n\nAdd a study session at this time?"):
+                self._add_study_task(s)
+        else:
+            messagebox.showinfo("Availability", text)
+ 
+    def _chosen_slots(self):
+        sel = self.fv.selection() or ()
+        return [self._slots[i] for i in sel if i in self._slots]
+ 
+    def copy_slots(self):
+        slots = self._chosen_slots()
+        if not slots:
+            messagebox.showinfo("Nothing selected", "Select one or more free slots first.")
+            return
+        text = "Study group — I'm free:\n" + "\n".join(f"• {s:%a %d %b}, {s:%H:%M}–{e:%H:%M}" for s, e in slots)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status.set("Copied — paste it into your group chat.")
+ 
+    def slot_to_task(self):
+        slots = self._chosen_slots()
+        if not slots:
+            messagebox.showinfo("Nothing selected", "Select a free slot first.")
+            return
+        self._add_study_task(slots[0][0])
+ 
+    def _add_study_task(self, s):
+        """Open the task form pre-filled for a study session starting at datetime `s`."""
+        fields = [("title", "Task", "Study group", "entry"), ("course", "Course", "", "entry"),
+                  ("due", "When (YYYY-MM-DD HH:MM)", s.strftime(DUE_FMT), "entry"),
+                  ("priority", "Priority", "Medium", "combo", ["Low", "Medium", "High"])]
+        def ok(v):
+            if not self._validate_task(v):
+                return False
+            self.store.tasks.append({"id": uuid.uuid4().hex, "done": False, **v})
+            self.store.save()
+            self.refresh_tasks()
+            self.status.set("Study session added to your tasks.")
+        FormDialog(self, "Add study session", fields, ok)
+ 
+    # ---------------- syncing ----------------
+    def sync_all(self):
+        if not self.store.sources:
+            self.status.set("No timetable sources yet — add one in the “Timetable Sources” tab.")
+            self.nb.select(2)
+            return
+        self.sync_sources(list(self.store.sources))
+ 
+    def sync_selected(self):
+        s = self._selected_source()
+        if s:
+            self.sync_sources([s])
+ 
+    def sync_sources(self, sources):
+        for s in sources:
+            self.syncing += 1
+            threading.Thread(target=self._worker, args=(s,), daemon=True).start()
+        self.sync_btn.state(["disabled"])
+        self.status.set(f"Syncing {len(sources)} source(s)…")
+ 
+    def _worker(self, s):
+        headers = {}
+        if s.get("headers") and ":" in s["headers"]:
+            k, _, v = s["headers"].partition(":")
+            headers[k.strip()] = v.strip()
+        try:
+            self.q.put(("ok", s["name"], fetch_timetable(s["url"], headers)))
+        except urllib.error.HTTPError as e:
+            self.q.put(("err", s["name"], f"HTTP {e.code} {e.reason}"))
+        except urllib.error.URLError as e:
+            self.q.put(("err", s["name"], f"Connection problem: {e.reason}"))
+        except Exception as e:
+            self.q.put(("err", s["name"], str(e)))
+ 
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, name, payload = self.q.get_nowait()
+                self.syncing -= 1
+                if kind == "ok":
+                    self.store.data["events"][name] = payload
+                    self.store.data["last_sync"][name] = datetime.now().strftime("%d %b %H:%M")
+                    self.store.save()
+                    self.status.set(f"“{name}”: {len(payload)} events loaded")
+                else:
+                    self.status.set(f"“{name}” failed: {payload}")
+                    messagebox.showerror("Sync failed", f"{name}\n\n{payload}")
+                if self.syncing <= 0:
+                    self.sync_btn.state(["!disabled"])
+                self.refresh_all()
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_queue)
+ 
+    # ---------------- misc ----------------
+    def _tick(self):
+        self.update_next_up()
+        self.refresh_tasks()
+        if self.view_var.get() != "List":
+            self.refresh_timetable()   # keeps the red "now" line and due markers current
+        self.after(60_000, self._tick)
+ 
+    def update_next_up(self):
+        now = datetime.now()
+        for e in self.store.all_events():
+            if e["all_day"] or e["owner"] != "Me":  # classmates' classes aren't "my" next up
+                continue
+            s = datetime.strptime(e["start"], ISO)
+            if s >= now:
+                delta = s - now
+                h, m = divmod(int(delta.total_seconds() // 60), 60)
+                when = f"in {h}h {m}m" if h else f"in {m} min"
+                if s.date() != now.date():
+                    when = f"{s:%a %H:%M}"
+                loc = f" @ {e['location']}" if e["location"] else ""
+                self.next_var.set(f"Next up: {e['title']}{loc} — {when}")
+                return
+        self.next_var.set("Next up: nothing scheduled")
+ 
+    def refresh_all(self):
+        self.refresh_timetable()
+        self.refresh_tasks()
+        self.refresh_sources()
+        self.update_next_up()
+ 
+    def _quit(self):
+        self.store.save()
+        self.destroy()
+ 
+ 
+if __name__ == "__main__":
+    PlannerApp().mainloop()
