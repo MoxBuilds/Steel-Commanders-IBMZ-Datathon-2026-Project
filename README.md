@@ -1,11 +1,8 @@
-# PanzerPlanner
-A student planner program made for IMB Z Datathon 2026
-
 # Student Planner
 
 A desktop student planner built with Python and tkinter. It pulls your class timetable from a university timetable service over a URL, lets you add classmates' calendars, tracks your assignments, and finds times when your study group is free.
 
-- **Single file:** `student_planner.py`
+- **Single file:** `panzer_planner v2`
 - **No dependencies:** Python standard library only
 - **Python:** 3.9 or newer
 
@@ -35,7 +32,7 @@ A desktop student planner built with Python and tkinter. It pulls your class tim
 3. Run the app:
 
 ```bash
-python student_planner.py
+python "panzer_planner v2"
 ```
 
 > **Windows note:** if your timetable uses named time zones (e.g. `Australia/Melbourne`) and times look wrong, run `pip install tzdata` so Python can read the time zone database.
@@ -152,7 +149,7 @@ Repeating events are expanded for a window of **60 days back to 400 days forward
 
 ## Project structure
 
-`student_planner.py` is organised into these sections:
+`panzer_planner v2` is organised into these sections:
 
 | Section | Purpose |
 | --- | --- |
