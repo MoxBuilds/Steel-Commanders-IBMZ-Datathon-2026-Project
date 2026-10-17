@@ -14,7 +14,7 @@ A desktop student planner built with Python and tkinter. It pulls your class tim
 | --- | --- |
 | **Timetable** | Four views, switched with the buttons at the top right: **List** (grouped by day), **Week** (hour-by-hour grid with a red "now" line), **Day** (one column per calendar, so you can compare classmates side by side) and **Month** (click a day to open it). Everything is colour-coded by calendar, overlapping classes sit side by side, and tasks due in the period are shown. Click a class for details. |
 | **Tasks & Assignments** | Add, edit, delete and complete tasks with course, due date and priority. Overdue tasks show red, tasks due within 2 days show amber. |
-| **Timetable Sources** | Add multiple iCal / webcal URLs: yours plus classmates'. Each has an owner, a colour and a show/hide switch. |
+| **Timetable Sources** | Add multiple iCal / webcal URLs: Your own and in addition, your classmates. Each has an owner, a colour and a show/hide switch. |
 | **Study Group Planner** | Pick several calendars and list the times when everyone is free. Copy slots to the clipboard or add one as a study task. |
 | **Next up banner** | Shows your next class and the time until it starts (your own calendars only). |
 | **Offline cache** | The last downloaded timetable is stored locally and shown even without a connection. |
