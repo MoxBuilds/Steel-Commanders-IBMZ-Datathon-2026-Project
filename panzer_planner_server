@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+
+#panzer_planner_server — shared backend for the Student Planner (runs on Linux, incl. IBM LinuxONE / s390x)
+#====================================================================================================
+
+#What it does
+#------------
+# Stores each student's calendar feed URLs (iCal / webcal) and downloads them on a schedule,
+  #so timetables stay fresh even when nobody has the desktop app open.
+# Lets students join a *group* and compare availability. Other members only ever receive
+ # "busy" time ranges: never the calendar URLs, never the class titles or locations.
+# Exposes a small JSON REST API that the tkinter app uses in "Server mode".
+
+#Requirements: Python 3.9+ and the standard library only.
+#Optional:     `pip install cryptography` to encrypt calendar URLs/tokens in the database.
+
+#Quick start
+#-----------
+#python panzer_planner_server adduser alice          # prints alice's API token (shown once)
+#python panzer_planner_server adduser sam
+#PLANNER_TZ=Australia/Melbourne python panzer_planner_server serve --host 0.0.0.0 --port 8765
+
+#Configuration (environment variables)
+#-------------------------------------
+#    PLANNER_DB             SQLite file                       (default ./planner.db)
+#    PLANNER_TZ             Time zone all times are shown in  (default: the server's own zone)
+#    PLANNER_SYNC_MINUTES   Background sync interval          (default 30; 0 disables)
+#    PLANNER_SECRET_KEY     Fernet key; enables encryption of stored URLs/headers
+#                           (generate:  python -c "from cryptography.fernet import Fernet;
+#                                       print(Fernet.generate_key().decode())")
+#    PLANNER_TRUST_PROXY    "1" when behind ONE reverse proxy: rate-limits by X-Forwarded-For instead
+#                           of the proxy's address (never set this if clients can reach the port directly)
+#    PLANNER_ALLOW_PRIVATE  "1" lets the server fetch feeds from private/loopback addresses
+#                           (off by default: blocks requests to internal networks)
+
+#Put it behind a TLS reverse proxy (nginx, Caddy, HAProxy) or pass --certfile/--keyfile.
+#Tokens are sent on every request, so do not expose the plain-HTTP port to an untrusted network.
+
+
+import argparse
+import concurrent.futures
+import contextlib
+import hashlib
+import http.client
+import ipaddress
+import json
+import os
+import re
+import secrets
+import socket
+import sqlite3
+import ssl
+import sys
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import planner_core as core
+
+API_VERSION = 1
+DB_PATH = os.environ.get("PLANNER_DB", "planner.db")
+SYNC_MINUTES = int(os.environ.get("PLANNER_SYNC_MINUTES", "30"))
+ALLOW_PRIVATE = os.environ.get("PLANNER_ALLOW_PRIVATE") == "1"
+TRUST_PROXY = os.environ.get("PLANNER_TRUST_PROXY") == "1"
+MAX_BODY = 64 * 1024
+MAX_SOURCES_PER_USER = 20
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,39}$")
+COLOR_NAMES = {"Blue", "Green", "Orange", "Pink", "Purple", "Teal", "Yellow", "Grey"}
+
+
+# ----------------------------------------------------------------------------
+# Optional encryption of stored secrets (feed URLs often contain access tokens)
+# ----------------------------------------------------------------------------
+_fernet = None
+_key = os.environ.get("PLANNER_SECRET_KEY")
+if _key:
+    try:
+        from cryptography.fernet import Fernet
+        _fernet = Fernet(_key.encode())
+    except ImportError:
+        sys.exit("PLANNER_SECRET_KEY is set but the 'cryptography' package is not installed.")
+    except Exception as e:
+        sys.exit("PLANNER_SECRET_KEY is not a valid Fernet key: %s" % e)
+
+
+def seal(text):
+    if not text or _fernet is None:
+        return text or ""
+    return "enc:" + _fernet.encrypt(text.encode()).decode()
+
+
+def unseal(text):
+    if not text or not text.startswith("enc:"):
+        return text or ""
+    if _fernet is None:
+        raise RuntimeError("Database holds encrypted values but PLANNER_SECRET_KEY is not set.")
+    return _fernet.decrypt(text[4:].encode()).decode()
+
+
+# ----------------------------------------------------------------------------
+# Database
+# ----------------------------------------------------------------------------
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, token_hash TEXT UNIQUE NOT NULL, created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sources(
+    id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL, url TEXT NOT NULL, headers TEXT NOT NULL DEFAULT '',
+    color TEXT NOT NULL DEFAULT 'Blue', owner TEXT NOT NULL DEFAULT 'Me',
+    visible INTEGER NOT NULL DEFAULT 1, share INTEGER NOT NULL DEFAULT 1,
+    last_sync TEXT, last_error TEXT, n_events INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(user_id, name));
+CREATE TABLE IF NOT EXISTS source_events(
+    source_id INTEGER PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS groups(
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL, code TEXT UNIQUE NOT NULL);
+CREATE TABLE IF NOT EXISTS group_members(
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    PRIMARY KEY(group_id, user_id));
+"""
+
+
+@contextlib.contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        with conn:  # commit on success, roll back on error
+            yield conn
+    finally:
+        conn.close()
+
+
+def init_db():
+    with db() as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.executescript(SCHEMA)
+
+
+def hash_token(token):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def stamp():
+    return core.now_local().strftime("%d %b %H:%M")
+
+
+# ----------------------------------------------------------------------------
+# Safe outbound fetching (users supply URLs, so stop the server being used to probe
+# internal networks: "SSRF"). Addresses are checked at connect time, which also
+# covers redirects and DNS tricks. Proxies from the environment are ignored.
+# ----------------------------------------------------------------------------
+def _guarded_connect(host, port, timeout):
+    last = None
+    for family, kind, proto, _, addr in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        ip = ipaddress.ip_address(addr[0])
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
+        if not ALLOW_PRIVATE and not ip.is_global:
+            last = ValueError("Blocked: that address is not on the public internet.")
+            continue
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(addr)
+            return sock
+        except OSError as e:
+            sock.close()
+            last = e
+    raise last or OSError("could not connect")
+
+
+class _GuardedHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        self.sock = _guarded_connect(self.host, self.port, self.timeout)
+
+
+class _GuardedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, context=None, **kwargs):
+        super().__init__(*args, context=context, **kwargs)
+        self.context = context or ssl.create_default_context()
+
+    def connect(self):
+        sock = _guarded_connect(self.host, self.port, self.timeout)
+        self.sock = self.context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_GuardedHTTPConnection, req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, context=None, check_hostname=None):
+        if context is None:
+            context = ssl.create_default_context()
+        if check_hostname is not None:
+            context.check_hostname = check_hostname
+        self.context = context
+        super().__init__(context=context, check_hostname=check_hostname)
+
+    def https_open(self, req):
+        return self.do_open(_GuardedHTTPSConnection, req, context=self.context)
+
+
+def build_opener():
+    op = urllib.request.OpenerDirector()
+    for h in (urllib.request.ProxyHandler({}), urllib.request.UnknownHandler(), _HTTPHandler(), _HTTPSHandler(),
+              urllib.request.HTTPRedirectHandler(), urllib.request.HTTPDefaultErrorHandler(),
+              urllib.request.HTTPErrorProcessor()):
+        op.add_handler(h)
+    return op
+
+
+OPENER = build_opener()
+
+
+def parse_headers(text):
+    """'Name: value' (optionally several lines) -> dict. CR/LF injection is impossible by construction."""
+    out = {}
+    for line in (text or "").splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            k, v = k.strip(), v.strip()
+            if re.fullmatch(r"[A-Za-z0-9\-]{1,64}", k) and v:
+                out[k] = v
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Syncing
+# ----------------------------------------------------------------------------
+def sync_source(source_id):
+    with db() as c:
+        row = c.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+    if row is None:
+        return None
+    events, err = [], None
+    try:
+        events = core.fetch_timetable(unseal(row["url"]), parse_headers(unseal(row["headers"])),
+                                      timeout=20, opener=OPENER)
+    except urllib.error.HTTPError as e:
+        err = "HTTP %s %s" % (e.code, e.reason)
+    except urllib.error.URLError as e:
+        err = "Connection problem: %s" % (e.reason,)
+    except Exception as e:
+        err = str(e) or e.__class__.__name__
+    with db() as c:
+        if err is None:
+            c.execute("INSERT OR REPLACE INTO source_events(source_id, data) VALUES(?, ?)",
+                      (source_id, json.dumps(events)))
+            c.execute("UPDATE sources SET last_sync=?, last_error=NULL, n_events=? WHERE id=?",
+                      (stamp(), len(events), source_id))
+        else:
+            c.execute("UPDATE sources SET last_error=? WHERE id=?", (err, source_id))
+    return {"id": source_id, "name": row["name"], "events": None if err else len(events), "error": err}
+
+
+def sync_many(ids):
+    ids = list(ids)
+    if not ids:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(ids))) as pool:
+        return [r for r in pool.map(sync_source, ids) if r]
+
+
+def background_sync_loop():
+    time.sleep(5)
+    first = True
+    while True:
+        try:
+            with db() as c:
+                ids = [r["id"] for r in c.execute(
+                    "SELECT id FROM sources" + (" WHERE last_sync IS NULL" if first else ""))]
+            sync_many(ids)
+        except Exception:
+            traceback.print_exc()
+        first = False
+        if SYNC_MINUTES <= 0:
+            return
+        time.sleep(SYNC_MINUTES * 60)
+
+
+# ----------------------------------------------------------------------------
+# Small helpers: errors, rate limiting, validation
+# ----------------------------------------------------------------------------
+class ApiError(Exception):
+    def __init__(self, status, msg):
+        super().__init__(msg)
+        self.status, self.msg = status, msg
+
+
+class FailureLimiter:
+    """Allow `limit` failures per key in `window` seconds (brute-force guard)."""
+
+    def __init__(self, limit=20, window=600):
+        self.limit, self.window, self.hits, self.lock = limit, window, {}, threading.Lock()
+
+    def _recent(self, key):
+        cutoff = time.time() - self.window
+        self.hits[key] = [t for t in self.hits.get(key, []) if t > cutoff]
+        return self.hits[key]
+
+    def blocked(self, key):
+        with self.lock:
+            return len(self._recent(key)) >= self.limit
+
+    def fail(self, key):
+        with self.lock:
+            self._recent(key).append(time.time())
+
+
+LIMITER = FailureLimiter()
+
+
+def clean_name(value, what="name"):
+    if not isinstance(value, str):
+        value = ""
+    value = value.strip()
+    if not NAME_RE.match(value):
+        raise ApiError(400, "The %s must be 1-40 characters: letters, numbers, spaces, - _ ." % what)
+    return value
+
+
+def clean_url(value):
+    if not isinstance(value, str):
+        value = ""
+    value = value.strip()
+    p = urllib.parse.urlparse(core.normalise_url(value))
+    if p.scheme not in ("http", "https") or not p.hostname:
+        raise ApiError(400, "The URL must start with https://, http:// or webcal://")
+    if len(value) > 2048:
+        raise ApiError(400, "That URL is too long.")
+    return value
+
+
+def clean_bool(value, default):
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ApiError(400, "Boolean options must be true or false.")
+    return value
+
+
+def source_dict(row):
+    return {"id": row["id"], "name": row["name"], "url": unseal(row["url"]), "headers": unseal(row["headers"]),
+            "color": row["color"], "owner": row["owner"], "visible": bool(row["visible"]),
+            "share": bool(row["share"]), "last_sync": row["last_sync"], "last_error": row["last_error"],
+            "events": row["n_events"]}
+
+
+# ----------------------------------------------------------------------------
+# Routes
+# ----------------------------------------------------------------------------
+ROUTES = []
+
+
+def route(method, pattern):
+    def deco(fn):
+        ROUTES.append((method, re.compile(pattern), fn))
+        return fn
+    return deco
+
+
+@route("GET", r"/api/me")
+def r_me(user, body, q):
+    return {"name": user["name"]}
+
+
+@route("GET", r"/api/sources")
+def r_sources(user, body, q):
+    with db() as c:
+        rows = c.execute("SELECT * FROM sources WHERE user_id=? ORDER BY id", (user["id"],)).fetchall()
+    return {"sources": [source_dict(r) for r in rows]}
+
+
+@route("POST", r"/api/sources")
+def r_source_add(user, body, q):
+    name, url = clean_name(body.get("name")), clean_url(body.get("url"))
+    color = body.get("color") if body.get("color") in COLOR_NAMES else "Blue"
+    owner = body.get("owner") if body.get("owner") in ("Me", "Classmate") else "Me"
+    with db() as c:
+        if c.execute("SELECT COUNT(*) FROM sources WHERE user_id=?", (user["id"],)).fetchone()[0] >= MAX_SOURCES_PER_USER:
+            raise ApiError(400, "You can have at most %d calendars." % MAX_SOURCES_PER_USER)
+        try:
+            cur = c.execute(
+                "INSERT INTO sources(user_id, name, url, headers, color, owner, visible, share) VALUES(?,?,?,?,?,?,?,?)",
+                (user["id"], name, seal(url), seal(str(body.get("headers") or "")[:500]), color, owner,
+                 int(clean_bool(body.get("visible"), True)), int(clean_bool(body.get("share"), True))))
+        except sqlite3.IntegrityError:
+            raise ApiError(409, "You already have a calendar with that name.")
+        sid = cur.lastrowid
+        row = c.execute("SELECT * FROM sources WHERE id=?", (sid,)).fetchone()
+    threading.Thread(target=sync_source, args=(sid,), daemon=True).start()
+    return 201, source_dict(row)
+
+
+def _own_source(c, user, sid):
+    row = c.execute("SELECT * FROM sources WHERE id=? AND user_id=?", (int(sid), user["id"])).fetchone()
+    if row is None:
+        raise ApiError(404, "No such calendar.")
+    return row
+
+
+@route("PUT", r"/api/sources/(\d+)")
+def r_source_update(user, body, q, sid):
+    with db() as c:
+        row = _own_source(c, user, sid)
+        new = {
+            "name": clean_name(body["name"]) if "name" in body else row["name"],
+            "url": seal(clean_url(body["url"])) if "url" in body else row["url"],
+            "headers": seal(str(body["headers"] or "")[:500]) if "headers" in body else row["headers"],
+            "color": body["color"] if body.get("color") in COLOR_NAMES else row["color"],
+            "owner": body["owner"] if body.get("owner") in ("Me", "Classmate") else row["owner"],
+            "visible": int(clean_bool(body["visible"], bool(row["visible"]))) if "visible" in body else row["visible"],
+            "share": int(clean_bool(body["share"], bool(row["share"]))) if "share" in body else row["share"],
+        }
+        try:
+            c.execute("UPDATE sources SET name=:name, url=:url, headers=:headers, color=:color, owner=:owner, "
+                      "visible=:visible, share=:share WHERE id=:id", dict(new, id=row["id"]))
+        except sqlite3.IntegrityError:
+            raise ApiError(409, "You already have a calendar with that name.")
+        row2 = c.execute("SELECT * FROM sources WHERE id=?", (row["id"],)).fetchone()
+    if new["url"] != row["url"] or new["headers"] != row["headers"]:
+        threading.Thread(target=sync_source, args=(row["id"],), daemon=True).start()
+    return source_dict(row2)
+
+
+@route("DELETE", r"/api/sources/(\d+)")
+def r_source_delete(user, body, q, sid):
+    with db() as c:
+        row = _own_source(c, user, sid)
+        c.execute("DELETE FROM sources WHERE id=?", (row["id"],))
+    return {"deleted": row["name"]}
+
+
+@route("POST", r"/api/sync")
+def r_sync(user, body, q):
+    with db() as c:
+        ids = [r["id"] for r in c.execute("SELECT id FROM sources WHERE user_id=?", (user["id"],))]
+    return {"results": sync_many(ids)}
+
+
+@route("GET", r"/api/events")
+def r_events(user, body, q):
+    out = {}
+    with db() as c:
+        for r in c.execute("SELECT s.name, e.data FROM sources s JOIN source_events e ON e.source_id = s.id "
+                           "WHERE s.user_id=?", (user["id"],)):
+            out[r["name"]] = json.loads(r["data"])
+    return {"events": out}
+
+
+# ---- groups: share availability (busy ranges only) with classmates
+def _group_for(c, user, gid):
+    g = c.execute("SELECT g.* FROM groups g JOIN group_members m ON m.group_id = g.id "
+                  "WHERE g.id=? AND m.user_id=?", (int(gid), user["id"])).fetchone()
+    if g is None:
+        raise ApiError(404, "No such group (or you are not a member).")
+    return g
+
+
+def _members(c, gid):
+    return [r["name"] for r in c.execute(
+        "SELECT u.name FROM group_members m JOIN users u ON u.id = m.user_id WHERE m.group_id=? ORDER BY u.name",
+        (gid,))]
+
+
+@route("GET", r"/api/groups")
+def r_groups(user, body, q):
+    with db() as c:
+        rows = c.execute("SELECT g.* FROM groups g JOIN group_members m ON m.group_id = g.id "
+                         "WHERE m.user_id=? ORDER BY g.id", (user["id"],)).fetchall()
+        return {"groups": [{"id": g["id"], "name": g["name"], "code": g["code"], "members": _members(c, g["id"])}
+                           for g in rows]}
+
+
+@route("POST", r"/api/groups")
+def r_group_create(user, body, q):
+    name = clean_name(body.get("name"), "group name")
+    with db() as c:
+        code = secrets.token_urlsafe(8)
+        cur = c.execute("INSERT INTO groups(name, code) VALUES(?, ?)", (name, code))
+        c.execute("INSERT INTO group_members VALUES(?, ?)", (cur.lastrowid, user["id"]))
+    return 201, {"id": cur.lastrowid, "name": name, "code": code, "members": [user["name"]]}
+
+
+@route("POST", r"/api/groups/join")
+def r_group_join(user, body, q):
+    key = ("join", user["id"])
+    if LIMITER.blocked(key):
+        raise ApiError(429, "Too many wrong invite codes. Try again later.")
+    code = str(body.get("code") or "").strip()
+    with db() as c:
+        g = c.execute("SELECT * FROM groups WHERE code=?", (code,)).fetchone()
+        if g is None:
+            LIMITER.fail(key)
+            raise ApiError(404, "That invite code was not found.")
+        c.execute("INSERT OR IGNORE INTO group_members VALUES(?, ?)", (g["id"], user["id"]))
+        return {"id": g["id"], "name": g["name"], "code": g["code"], "members": _members(c, g["id"])}
+
+
+@route("POST", r"/api/groups/(\d+)/leave")
+def r_group_leave(user, body, q, gid):
+    with db() as c:
+        g = _group_for(c, user, gid)
+        c.execute("DELETE FROM group_members WHERE group_id=? AND user_id=?", (g["id"], user["id"]))
+        if not c.execute("SELECT 1 FROM group_members WHERE group_id=?", (g["id"],)).fetchone():
+            c.execute("DELETE FROM groups WHERE id=?", (g["id"],))
+    return {"left": g["name"]}
+
+
+@route("GET", r"/api/groups/(\d+)/busy")
+def r_group_busy(user, body, q, gid):
+    """Busy time ranges of every member over a date window. No titles, locations or URLs leave the server."""
+    try:
+        start = datetime.strptime((q.get("start") or [core.now_local().strftime("%Y-%m-%d")])[0], "%Y-%m-%d")
+        days = max(1, min(60, int((q.get("days") or ["7"])[0])))
+    except ValueError:
+        raise ApiError(400, "Use start=YYYY-MM-DD and days=1..60")
+    end = start + timedelta(days=days)
+    members, no_data = {}, []
+    with db() as c:
+        g = _group_for(c, user, gid)
+        for m in c.execute("SELECT u.id, u.name FROM group_members m JOIN users u ON u.id = m.user_id "
+                           "WHERE m.group_id=?", (g["id"],)).fetchall():
+            busy, shared = [], 0
+            for r in c.execute("SELECT e.data FROM sources s JOIN source_events e ON e.source_id = s.id "
+                               "WHERE s.user_id=? AND s.share=1", (m["id"],)):
+                shared += 1
+                for e in json.loads(r["data"]):
+                    if e["all_day"]:
+                        continue
+                    s, en = datetime.strptime(e["start"], core.ISO), datetime.strptime(e["end"], core.ISO)
+                    if en > start and s < end:
+                        busy.append({"start": e["start"], "end": e["end"]})
+            members[m["name"]] = busy
+            if not shared:
+                no_data.append(m["name"])
+    return {"group": g["name"], "members": members, "no_data": no_data}
+
+
+# ----------------------------------------------------------------------------
+# HTTP layer
+# ----------------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    server_version = "StudentPlanner/%d" % API_VERSION
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self._handle("GET")
+
+    def do_POST(self):
+        self._handle("POST")
+
+    def do_PUT(self):
+        self._handle("PUT")
+
+    def do_DELETE(self):
+        self._handle("DELETE")
+
+    def log_message(self, format, *args):  # one terse line, never headers or bodies
+        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), format % args))
+
+    def _send(self, status, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _auth(self):
+        ip = self.client_address[0]
+        if TRUST_PROXY:   # behind a reverse proxy every request arrives from the proxy's address
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            ip = forwarded.split(",")[-1].strip() or ip   # the entry our own proxy appended
+        if LIMITER.blocked(("auth", ip)):
+            raise ApiError(429, "Too many failed attempts. Try again later.")
+        header = self.headers.get("Authorization", "")
+        token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        if token:
+            with db() as c:
+                row = c.execute("SELECT * FROM users WHERE token_hash=?", (hash_token(token),)).fetchone()
+            if row:
+                return row
+        LIMITER.fail(("auth", ip))
+        raise ApiError(401, "Missing or invalid token.")
+
+    def _body(self):
+        raw_length = self.headers.get("Content-Length")
+        if self.headers.get("Transfer-Encoding"):
+            raise ApiError(400, "Transfer-Encoding is not supported.")
+        try:
+            length = int(raw_length or 0)
+        except ValueError:
+            raise ApiError(400, "Invalid Content-Length.")
+        if length < 0:
+            raise ApiError(400, "Invalid Content-Length.")
+        if length > MAX_BODY:
+            raise ApiError(413, "Request too large.")
+        if not length:
+            return {}
+        try:
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ApiError(400, "Incomplete request body.")
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise ApiError(400, "The request body must be JSON.")
+        if not isinstance(data, dict):
+            raise ApiError(400, "The request body must be a JSON object.")
+        return data
+
+    def _handle(self, method):
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+            if method == "GET" and path == "/api/health":
+                return self._send(200, {"ok": True, "api": API_VERSION,
+                                        "tz": str(core.LOCAL_TZ) if core.LOCAL_TZ else None})
+            handler = None
+            args = ()
+            for m, pattern, fn in ROUTES:
+                match = pattern.fullmatch(path)
+                if match and m == method:
+                    handler, args = fn, match.groups()
+                    break
+                if match:
+                    handler = False
+            if handler is None:
+                raise ApiError(404, "Not found.")
+            if handler is False:
+                raise ApiError(405, "Method not allowed.")
+            user = self._auth()
+            body = self._body() if method in ("POST", "PUT") else {}
+            result = handler(user, body, urllib.parse.parse_qs(parsed.query), *args)
+            status, obj = result if isinstance(result, tuple) else (200, result)
+            self._send(status, obj)
+        except ApiError as e:
+            self.close_connection = True   # a rejected request may leave its body unread on the socket
+            self._send(e.status, {"error": e.msg})
+        except Exception:
+            traceback.print_exc()
+            self._send(500, {"error": "Internal server error."})
+
+
+# ----------------------------------------------------------------------------
+# Command line
+# ----------------------------------------------------------------------------
+def cmd_adduser(args):
+    name = args.name.strip()
+    if not NAME_RE.match(name):
+        sys.exit("Names are 1-40 characters: letters, numbers, spaces, - _ .")
+    token = secrets.token_urlsafe(32)
+    try:
+        with db() as c:
+            c.execute("INSERT INTO users(name, token_hash, created) VALUES(?,?,?)",
+                      (name, hash_token(token), stamp()))
+    except sqlite3.IntegrityError:
+        sys.exit("A user called %r already exists (use resettoken to issue a new token)." % name)
+    print("User %r created.\nAPI token (shown once, keep it secret):\n\n    %s\n" % (name, token))
+
+
+def cmd_resettoken(args):
+    token = secrets.token_urlsafe(32)
+    with db() as c:
+        cur = c.execute("UPDATE users SET token_hash=? WHERE name=?", (hash_token(token), args.name))
+    if not cur.rowcount:
+        sys.exit("No such user.")
+    print("New API token for %r (the old one no longer works):\n\n    %s\n" % (args.name, token))
+
+
+def cmd_listusers(args):
+    with db() as c:
+        for r in c.execute("SELECT u.name, u.created, (SELECT COUNT(*) FROM sources s WHERE s.user_id=u.id) n "
+                           "FROM users u ORDER BY u.id"):
+            print("%-24s created %s, %d calendar(s)" % (r["name"], r["created"], r["n"]))
+
+
+def cmd_serve(args):
+    tz = os.environ.get("PLANNER_TZ")
+    if tz:
+        try:
+            core.set_local_tz(tz)
+        except Exception as e:
+            sys.exit("Bad PLANNER_TZ %r: %s (on minimal images run: pip install tzdata)" % (tz, e))
+    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd.daemon_threads = True
+    scheme = "http"
+    if args.certfile:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(args.certfile, args.keyfile)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+    elif args.host not in ("127.0.0.1", "localhost", "::1"):
+        print("WARNING: listening on %s without TLS. Put a TLS reverse proxy in front, "
+              "or use --certfile/--keyfile." % args.host, file=sys.stderr)
+    threading.Thread(target=background_sync_loop, daemon=True).start()
+    print("Student Planner server on %s://%s:%d  (db=%s, tz=%s, sync every %s min%s)" % (
+        scheme, args.host, args.port, DB_PATH, tz or "system", SYNC_MINUTES or "never",
+        ", secrets encrypted" if _fernet else ""), flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping.")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Student Planner server")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("serve", help="run the API server")
+    s.add_argument("--host", default=os.environ.get("PLANNER_HOST", "127.0.0.1"))
+    s.add_argument("--port", type=int, default=int(os.environ.get("PLANNER_PORT", "8765")))
+    s.add_argument("--certfile")
+    s.add_argument("--keyfile")
+    s.set_defaults(fn=cmd_serve)
+    a = sub.add_parser("adduser", help="create a user and print their API token")
+    a.add_argument("name")
+    a.set_defaults(fn=cmd_adduser)
+    r = sub.add_parser("resettoken", help="issue a new API token for a user")
+    r.add_argument("name")
+    r.set_defaults(fn=cmd_resettoken)
+    l = sub.add_parser("listusers", help="list users")
+    l.set_defaults(fn=cmd_listusers)
+    args = p.parse_args(argv)
+    init_db()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

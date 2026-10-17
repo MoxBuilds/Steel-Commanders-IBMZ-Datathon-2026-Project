@@ -1,0 +1,173 @@
+# Student Planner server (IBM LinuxONE / any Linux)
+
+`panzer_planner_server` is the shared backend for the Student Planner. It keeps everyone's calendar feeds in one place, refreshes them on a schedule, and lets a study group compare availability without anybody seeing each other's calendar links or class details.
+
+It uses only the Python standard library (SQLite for storage), so it runs unchanged on x86, ARM and **s390x (IBM Z / LinuxONE)**.
+
+ Student laptops (tkinter, "Server mode")            LinuxONE Linux guest
+ ┌───────────────────────┐   HTTPS + token   ┌────────────────────────────────────┐
+ │ panzer_planner v2     │ ───────────────▶  │ reverse proxy (TLS)                │
+ │ panzer_planner_client│                   │   └─▶ panzer_planner_server        │
+ └───────────────────────┘                   │        ├─ SQLite (planner.db)      │
+                                             │        └─ sync worker ──▶ university│
+                                             │             (every 30 min)   iCal URLs
+                                             └────────────────────────────────────┘
+
+## Files
+
+| File | Where it runs | Purpose |
+| --- | --- | --- |
+| `planner_core.py` | server | iCal parsing, recurrence, feed fetching (no GUI code) |
+| `panzer_planner_server` | server | REST API, storage, scheduled sync, groups |
+| `panzer_planner_client` | laptops | small API client helper |
+| `panzer_planner v2` | laptops | the tkinter app |
+| `Dockerfile` | server | optional container image |
+
+Keep `planner_core.py` next to `panzer_planner_server` on the server.
+
+## 1. Try it locally first
+
+bash
+python panzer_planner_server adduser alice        # prints alice's API token once
+python panzer_planner_server adduser sam
+PLANNER_TZ=Australia/Melbourne python panzer_planner_server serve      # http://127.0.0.1:8765
+
+
+Then in the desktop app click **Server…**, enter `http://127.0.0.1:8765` and the token, and choose **Use server**. If you already have local calendars, the app offers to upload them.
+
+## 2. Deploy on a LinuxONE guest
+
+These steps assume a RHEL, SLES or Ubuntu guest for s390x with Python 3.9 or newer.
+
+bash
+sudo useradd --system --home /var/lib/student-planner --create-home planner
+sudo mkdir -p /opt/student-planner
+sudo cp planner_core.py panzer_planner_server /opt/student-planner/
+sudo -u planner PLANNER_DB=/var/lib/student-planner/planner.db \
+     python3 /opt/student-planner/panzer_planner_server adduser alice
+
+
+**systemd service** (`/etc/systemd/system/student-planner.service`):
+
+ini
+[Unit]
+Description=Student Planner server
+After=network-online.target
+
+[Service]
+User=planner
+WorkingDirectory=/opt/student-planner
+Environment=PLANNER_DB=/var/lib/student-planner/planner.db
+Environment=PLANNER_TZ=Australia/Melbourne
+Environment=PLANNER_TRUST_PROXY=1
+EnvironmentFile=-/etc/student-planner.env
+ExecStart=/usr/bin/python3 /opt/student-planner/panzer_planner_server serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/student-planner
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+
+
+bash
+sudo systemctl daemon-reload && sudo systemctl enable --now student-planner
+journalctl -u student-planner -f
+
+
+**TLS:** the app sends a token on every request, so serve it over HTTPS. The simplest option is a reverse proxy such as Caddy (automatic certificates):
+
+
+planner.example.edu {
+    reverse_proxy 127.0.0.1:8765
+}
+
+
+(nginx or HAProxy work equally well. Alternatively pass `--certfile` and `--keyfile` to the server.) Only set `PLANNER_TRUST_PROXY=1` when the proxy is the only way to reach the server.
+
+**Container option** (Docker or Podman on the guest):
+
+```bash
+docker build -t student-planner .
+docker run --rm -v planner-data:/data student-planner adduser alice
+docker run -d --name planner -p 127.0.0.1:8765:8765 -v planner-data:/data \
+       -e PLANNER_TZ=Australia/Melbourne -e PLANNER_TRUST_PROXY=1 student-planner
+```
+
+## Configuration
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PLANNER_DB` | `./planner.db` | SQLite file |
+| `PLANNER_TZ` | server's zone | Zone every time is shown in. **Set this** (e.g. `Australia/Melbourne`); servers are often on UTC |
+| `PLANNER_SYNC_MINUTES` | `30` | Background refresh interval (`0` = off) |
+| `PLANNER_SECRET_KEY` | unset | Fernet key; encrypts stored calendar URLs and headers (needs `pip install cryptography`) |
+| `PLANNER_TRUST_PROXY` | `0` | Rate-limit by `X-Forwarded-For` when behind one proxy |
+| `PLANNER_ALLOW_PRIVATE` | `0` | Allow fetching feeds from private/loopback addresses (testing only) |
+| `PLANNER_HOST`, `PLANNER_PORT` | `127.0.0.1`, `8765` | Listen address |
+
+Generate an encryption key once and keep it in `/etc/student-planner.env` (readable only by root and the service):
+
+```bash
+python3 -c "from cryptography.fernet import Fernet; print('PLANNER_SECRET_KEY=' + Fernet.generate_key().decode())"
+```
+
+Lose the key and the stored URLs cannot be decrypted, so back it up separately from the database.
+
+## Users and groups
+
+- **Users** are created by the administrator: `adduser NAME` prints a token once. `resettoken NAME` replaces it, and `listusers` shows who exists. Tokens are stored only as SHA-256 hashes.
+- **Groups** are created inside the app (Study Group Planner → *New group*). The creator gets an **invite code** to share with classmates, who use *Join*.
+- Each calendar has a **Shared** setting. Only shared calendars contribute to a group's availability.
+
+## What other people can and cannot see
+
+| Data | Other group members |
+| --- | --- |
+| Your calendar URLs and headers | Never |
+| Class titles, locations, descriptions | Never |
+| Busy time ranges (start and end only) from calendars marked Shared | Yes |
+| Your username and that you belong to the group | Yes |
+
+The administrator of the server can see everything in the database (URLs are encrypted only if you set `PLANNER_SECRET_KEY`, and the key sits on the same machine). Say so to your users.
+
+## Security notes
+
+- Users supply URLs that the **server** downloads, which could be abused to probe internal networks (SSRF). The server refuses non-public addresses at connection time, including after redirects, and ignores proxy environment variables. This is a best-effort guard. Run the service in a network segment that cannot reach sensitive internal hosts anyway.
+- Feeds are limited to 8 MB, requests to 64 KB, and failed logins and invite-code guesses are rate-limited.
+- The API has no password-reset or self-registration. All accounts come from the administrator.
+- Backups: `sqlite3 /var/lib/student-planner/planner.db ".backup /backups/planner-$(date +%F).db"`.
+- All users in one server share one time zone setting (`PLANNER_TZ`), and the app adopts it automatically in Server mode.
+
+## API summary
+
+All routes except `/api/health` need `Authorization: Bearer <token>`.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /api/health` | Status and the server's time zone |
+| `GET /api/me` | Who the token belongs to |
+| `GET /api/sources`, `POST /api/sources` | List / add your calendars |
+| `PUT /api/sources/<id>`, `DELETE /api/sources/<id>` | Edit / remove one |
+| `POST /api/sync` | Refresh all your calendars now |
+| `GET /api/events` | Your cached events |
+| `GET /api/groups`, `POST /api/groups` | List / create groups |
+| `POST /api/groups/join` | Join with an invite code |
+| `POST /api/groups/<id>/leave` | Leave a group |
+| `GET /api/groups/<id>/busy?start=YYYY-MM-DD&days=7` | Members' busy ranges |
+
+## Notes for IBM Z and LinuxONE
+
+- The code is pure Python, so the s390x architecture (big-endian) makes no difference to it.
+- OpenSSL on s390x normally uses the processor's built-in crypto acceleration (CPACF) for TLS and Fernet, with no code changes.
+- `cryptography` may need to compile from source on s390x if no wheel exists for your Python version. This needs a Rust toolchain and takes a while. The server runs fine without it, you just lose at-rest encryption.
+- A free trial environment for learning has been offered through the IBM LinuxONE Community Cloud. Check IBM's current terms.
+- z/OS is not needed for any of this. It would only matter if you integrate with an official enrolment system that runs there.
+
+## What has and hasn't been tested
+
+Tested on x86-64 Linux with Python 3.12 and 3.13: the full API (authentication, isolation between users, privacy of group data, SSRF blocking, rate limiting, encryption at rest), and the desktop app against a live server (connect, upload, groups, free-time search, restart persistence).
+
+**Not tested:** running on s390x hardware, building the Dockerfile, the TLS options, and running behind a reverse proxy.

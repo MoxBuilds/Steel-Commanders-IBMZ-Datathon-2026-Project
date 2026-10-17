@@ -1,0 +1,91 @@
+#panzer_planner_client — tiny client for panzer_planner_server (standard library only, no tkinter).
+
+#Used by the desktop app's "Server mode". Every method blocks, so the GUI calls them from
+#a background thread.
+
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+class ServerError(Exception):
+    #Raised with a message that is safe to show to the user.
+    pass
+
+
+class ServerClient:
+    def __init__(self, base_url, token, timeout=30):
+        base_url = (base_url or "").strip().rstrip("/")
+        if not base_url.lower().startswith(("http://", "https://")):
+            raise ServerError("The server address must start with https:// (or http:// for a local test).")
+        self.base, self.token, self.timeout = base_url, (token or "").strip(), timeout
+
+    # ---- plumbing
+    def _call(self, method, path, body=None, auth=True, timeout=None):
+        headers = {"Accept": "application/json", "User-Agent": "StudentPlanner-Client/1"}
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if auth:
+            headers["Authorization"] = "Bearer " + self.token
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            try:
+                msg = json.loads(e.read().decode("utf-8")).get("error", "")
+            except Exception:
+                msg = ""
+            if e.code == 401:
+                msg = "The server rejected your token. Check it in Server settings."
+            raise ServerError(msg or "The server returned HTTP %d." % e.code)
+        except urllib.error.URLError as e:
+            raise ServerError("Could not reach the server: %s" % (e.reason,))
+        except (OSError, ValueError) as e:
+            raise ServerError("Problem talking to the server: %s" % e)
+
+    # ---- API
+    def health(self):
+        return self._call("GET", "/api/health", auth=False)
+
+    def me(self):
+        return self._call("GET", "/api/me")
+
+    def sources(self):
+        return self._call("GET", "/api/sources")
+
+    def add_source(self, fields):
+        return self._call("POST", "/api/sources", fields)
+
+    def update_source(self, source_id, fields):
+        return self._call("PUT", "/api/sources/%d" % source_id, fields)
+
+    def delete_source(self, source_id):
+        return self._call("DELETE", "/api/sources/%d" % source_id)
+
+    def sync(self):
+        return self._call("POST", "/api/sync", {}, timeout=180)
+
+    def events(self):
+        return self._call("GET", "/api/events", timeout=60)
+
+    def groups(self):
+        return self._call("GET", "/api/groups")
+
+    def create_group(self, name):
+        return self._call("POST", "/api/groups", {"name": name})
+
+    def join_group(self, code):
+        return self._call("POST", "/api/groups/join", {"code": code})
+
+    def leave_group(self, group_id):
+        return self._call("POST", "/api/groups/%d/leave" % group_id, {})
+
+    def busy(self, group_id, start, days):
+        q = urllib.parse.urlencode({"start": start, "days": days})
+        return self._call("GET", "/api/groups/%d/busy?%s" % (group_id, q))
